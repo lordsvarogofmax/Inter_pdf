@@ -1,5 +1,5 @@
 Flask==3.0.3
-python-telegram-bot==20.7
+python-telegram-bot>=21.0  # ← обнови эту строку
 PyPDF2==3.0.1
 requests==2.31.0
 python-dotenv==1.0.1
