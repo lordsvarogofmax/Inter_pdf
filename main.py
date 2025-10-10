@@ -18,7 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -26,97 +25,80 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN or not WEBHOOK_URL:
-    logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set in environment variables!")
+    logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
     sys.exit(1)
 
-# === ИНИЦИАЛИЗАЦИЯ ===
 app = Flask(__name__)
-application = Application.builder().token(BOT_TOKEN).build()
 
+# === ГЛОБАЛЬНОЕ ПРИЛОЖЕНИЕ (инициализируем один раз) ===
+application = None
 
-# === КОМАНДА /start ===
+async def init_application():
+    global application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Регистрируем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Инициализируем Application (обязательно!)
+    await application.initialize()
+    logger.info("✅ Application initialized")
+
+# === ОБРАБОТЧИКИ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "👋 Привет! Я бот для извлечения текста из PDF.\n\n"
-        "📄 Просто отправь мне PDF-файл — я:\n"
-        "1. Извлеку весь текст\n"
-        "2. (Опционально) структурирую его с помощью ИИ\n"
-        "3. Верну готовый `.txt` файл\n\n"
-        "Отправляй PDF прямо сейчас!"
+    await update.message.reply_text(
+        "👋 Привет! Отправь мне PDF — я извлеку текст и пришлю .txt файл."
     )
-    await update.message.reply_text(welcome_text)
 
-
-# === ОБРАБОТКА PDF ===
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.info(f"📥 PDF from user {user.id} ({user.username or 'no username'})")
-
     try:
         doc = update.message.document
         if doc.mime_type != "application/pdf":
-            await update.message.reply_text("Пожалуйста, отправьте именно PDF-файл.")
+            await update.message.reply_text("Пожалуйста, отправьте PDF.")
             return
 
         file = await doc.get_file()
         file_bytes = await file.download_as_bytearray()
-        logger.info(f"💾 File size: {len(file_bytes)} bytes")
-
-        # Извлечение текста
         pdf = PyPDF2.PdfReader(BytesIO(file_bytes))
-        raw_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-        logger.info(f"📄 Extracted {len(raw_text)} characters")
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-        if not raw_text.strip():
-            await update.message.reply_text("Не удалось извлечь текст из PDF.")
+        if not text.strip():
+            await update.message.reply_text("Не удалось извлечь текст.")
             return
 
-        # Структуризация (если есть ключ OpenRouter)
         if OPENROUTER_API_KEY:
             logger.info("🧠 Structuring with OpenRouter...")
-            structured = await structure_with_openrouter(raw_text)
-        else:
-            structured = raw_text
+            text = await structure_with_openrouter(text)
 
-        # Отправка TXT
-        txt = BytesIO(structured.encode("utf-8"))
+        txt = BytesIO(text.encode("utf-8"))
         txt.name = "output.txt"
         await update.message.reply_document(document=txt)
 
-        # Подсказка: можно прислать ещё
         reply_markup = ReplyKeyboardMarkup(
             [[KeyboardButton("📄 Отправить новый PDF")]],
             resize_keyboard=True,
             one_time_keyboard=True
         )
         await update.message.reply_text(
-            "✅ Готово! Если нужно обработать ещё один PDF — просто пришлите его.",
+            "✅ Готово! Отправляй следующий PDF.",
             reply_markup=reply_markup
         )
-        logger.info("📤 TXT sent + hint message")
-
     except Exception as e:
-        logger.exception("💥 Error in handle_pdf:")
-        await update.message.reply_text("Произошла ошибка при обработке файла. Попробуйте снова.")
+        logger.exception("💥 Error in handle_pdf")
+        await update.message.reply_text("Ошибка при обработке файла.")
 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📎 Пожалуйста, отправьте PDF-файл.")
 
 async def structure_with_openrouter(text: str) -> str:
-    prompt = f"""
-Разбей следующий текст на логически завершённые блоки.
-Сохрани исходный смысл, но сделай структуру читаемой.
-Верни только текст, без пояснений.
-
-Текст:
-{text}
-"""
+    prompt = f"Разбей на логические блоки и верни только текст:\n\n{text}"
     try:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-            json={
-                "model": "meta-llama/llama-3-8b-instruct:free",
-                "messages": [{"role": "user", "content": prompt}]
-            },
+            json={"model": "meta-llama/llama-3-8b-instruct:free", "messages": [{"role": "user", "content": prompt}]},
             timeout=30
         )
         if resp.status_code == 200:
@@ -128,20 +110,16 @@ async def structure_with_openrouter(text: str) -> str:
         logger.exception("OpenRouter failed")
         return text
 
-
-# === WEBHOOK (Flask + asyncio) ===
+# === WEBHOOK ===
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     json_data = request.get_json(force=True)
-    if not json_data:
+    if not json_
         return "Bad Request", 400
     update = Update.de_json(json_data, application.bot)
-    asyncio.run(process_update(update))
+    # Запускаем обработку в том же event loop'е
+    asyncio.create_task(application.process_update(update))
     return "OK", 200
-
-async def process_update(update: Update):
-    await application.process_update(update)
-
 
 # === УСТАНОВКА WEBHOOK ===
 def set_webhook_sync():
@@ -152,20 +130,15 @@ def set_webhook_sync():
     else:
         logger.error(f"❌ Webhook failed: {resp.text}")
 
-
 # === ЗАПУСК ===
 if __name__ == "__main__":
     logger.info("🚀 Starting bot...")
 
-    # Регистрируем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-    # Игнорируем кнопку — она просто для UX
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pdf))
+    # Инициализируем Application один раз
+    asyncio.run(init_application())
 
     # Устанавливаем webhook
     set_webhook_sync()
 
-    # Запуск Flask
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
