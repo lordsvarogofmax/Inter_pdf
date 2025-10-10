@@ -5,8 +5,8 @@ import asyncio
 import requests
 from io import BytesIO
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import PyPDF2
 from dotenv import load_dotenv
 
@@ -33,6 +33,20 @@ if not BOT_TOKEN or not WEBHOOK_URL:
 app = Flask(__name__)
 application = Application.builder().token(BOT_TOKEN).build()
 
+
+# === КОМАНДА /start ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "👋 Привет! Я бот для извлечения текста из PDF.\n\n"
+        "📄 Просто отправь мне PDF-файл — я:\n"
+        "1. Извлеку весь текст\n"
+        "2. (Опционально) структурирую его с помощью ИИ\n"
+        "3. Верну готовый `.txt` файл\n\n"
+        "Отправляй PDF прямо сейчас!"
+    )
+    await update.message.reply_text(welcome_text)
+
+
 # === ОБРАБОТКА PDF ===
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -41,7 +55,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         doc = update.message.document
         if doc.mime_type != "application/pdf":
-            await update.message.reply_text("Пожалуйста, отправьте PDF-файл.")
+            await update.message.reply_text("Пожалуйста, отправьте именно PDF-файл.")
             return
 
         file = await doc.get_file()
@@ -68,11 +82,22 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = BytesIO(structured.encode("utf-8"))
         txt.name = "output.txt"
         await update.message.reply_document(document=txt)
-        logger.info("📤 TXT sent")
+
+        # Подсказка: можно прислать ещё
+        reply_markup = ReplyKeyboardMarkup(
+            [[KeyboardButton("📄 Отправить новый PDF")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await update.message.reply_text(
+            "✅ Готово! Если нужно обработать ещё один PDF — просто пришлите его.",
+            reply_markup=reply_markup
+        )
+        logger.info("📤 TXT sent + hint message")
 
     except Exception as e:
         logger.exception("💥 Error in handle_pdf:")
-        await update.message.reply_text("Произошла ошибка при обработке файла.")
+        await update.message.reply_text("Произошла ошибка при обработке файла. Попробуйте снова.")
 
 
 async def structure_with_openrouter(text: str) -> str:
@@ -104,7 +129,7 @@ async def structure_with_openrouter(text: str) -> str:
         return text
 
 
-# === WEBHOOK (СИНХРОННЫЙ FLASK + АСИНХРОННЫЙ TELEGRAM) ===
+# === WEBHOOK (Flask + asyncio) ===
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     json_data = request.get_json(force=True)
@@ -118,7 +143,7 @@ async def process_update(update: Update):
     await application.process_update(update)
 
 
-# === УСТАНОВКА WEBHOOK ЧЕРЕЗ HTTP ===
+# === УСТАНОВКА WEBHOOK ===
 def set_webhook_sync():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     resp = requests.post(url, json={"url": WEBHOOK_URL})
@@ -132,12 +157,15 @@ def set_webhook_sync():
 if __name__ == "__main__":
     logger.info("🚀 Starting bot...")
 
+    # Регистрируем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    # Игнорируем кнопку — она просто для UX
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pdf))
+
     # Устанавливаем webhook
     set_webhook_sync()
 
-    # Регистрируем обработчик
-    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-
-    # Запуск Flask на порту из Render
+    # Запуск Flask
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
