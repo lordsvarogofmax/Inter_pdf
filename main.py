@@ -10,7 +10,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import PyPDF2
 from dotenv import load_dotenv
 
-# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -30,23 +29,22 @@ if not BOT_TOKEN or not WEBHOOK_URL:
 
 app = Flask(__name__)
 
-# === ГЛОБАЛЬНОЕ ПРИЛОЖЕНИЕ (инициализируем один раз) ===
-application = None
+# Создаём Application один раз (глобально)
+_bot_app = None
 
-async def init_application():
-    global application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Регистрируем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+def get_application():
+    global _bot_app
+    if _bot_app is None:
+        _bot_app = Application.builder().token(BOT_TOKEN).build()
+        _bot_app.add_handler(CommandHandler("start", start))
+        _bot_app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+        _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        # Инициализируем один раз
+        asyncio.run(_bot_app.initialize())
+        logger.info("✅ Application initialized")
+    return _bot_app
 
-    # Инициализируем Application (обязательно!)
-    await application.initialize()
-    logger.info("✅ Application initialized")
 
-# === ОБРАБОТЧИКИ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Отправь мне PDF — я извлеку текст и пришлю .txt файл."
@@ -110,15 +108,20 @@ async def structure_with_openrouter(text: str) -> str:
         logger.exception("OpenRouter failed")
         return text
 
-# === WEBHOOK ===
+# === ВАЖНО: СИНХРОННЫЙ WEBHOOK ===
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     json_data = request.get_json(force=True)
     if not json_data:
         return "Bad Request", 400
+
+    # Получаем Application (инициализируется один раз)
+    application = get_application()
     update = Update.de_json(json_data, application.bot)
-    # Запускаем обработку в том же event loop'е
-    asyncio.create_task(application.process_update(update))
+
+    # Запускаем обработку в новом event loop'е
+    asyncio.run(application.process_update(update))
+
     return "OK", 200
 
 # === УСТАНОВКА WEBHOOK ===
@@ -133,11 +136,6 @@ def set_webhook_sync():
 # === ЗАПУСК ===
 if __name__ == "__main__":
     logger.info("🚀 Starting bot...")
-
-    # Инициализируем Application один раз
-    asyncio.run(init_application())
-
-    # Устанавливаем webhook
     set_webhook_sync()
 
     port = int(os.environ.get("PORT", 10000))
