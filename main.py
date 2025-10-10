@@ -133,7 +133,7 @@ async def structure_with_openrouter(text: str) -> str:
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     json_data = request.get_json(force=True)
-    if not json_
+    if not json_data:
         return "Bad Request", 400
     update = Update.de_json(json_data, application.bot)
     asyncio.run(process_update(update))
