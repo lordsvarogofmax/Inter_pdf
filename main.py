@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import asyncio
 import requests
 from io import BytesIO
 from flask import Flask, request
@@ -17,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# === ЗАГРУЗКА ПЕРЕМЕННЫХ ===
+# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -25,19 +26,17 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN or not WEBHOOK_URL:
-    logger.critical("❌ BOT_TOKEN or WEBHOOK_URL is missing! Set them in Render Environment Variables.")
+    logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set in environment variables!")
     sys.exit(1)
 
-# === FLASK ===
+# === ИНИЦИАЛИЗАЦИЯ ===
 app = Flask(__name__)
-
-# === TELEGRAM APPLICATION ===
 application = Application.builder().token(BOT_TOKEN).build()
 
 # === ОБРАБОТКА PDF ===
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logger.info(f"📥 Received PDF from user {user_id}")
+    user = update.effective_user
+    logger.info(f"📥 PDF from user {user.id} ({user.username or 'no username'})")
 
     try:
         doc = update.message.document
@@ -47,33 +46,29 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         file = await doc.get_file()
         file_bytes = await file.download_as_bytearray()
-        logger.info(f"💾 Downloaded {len(file_bytes)} bytes")
+        logger.info(f"💾 File size: {len(file_bytes)} bytes")
 
         # Извлечение текста
-        pdf_reader = PyPDF2.PdfReader(BytesIO(file_bytes))
-        raw_text = ""
-        for i, page in enumerate(pdf_reader.pages):
-            text = page.extract_text() or ""
-            raw_text += text + "\n"
+        pdf = PyPDF2.PdfReader(BytesIO(file_bytes))
+        raw_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
         logger.info(f"📄 Extracted {len(raw_text)} characters")
 
         if not raw_text.strip():
             await update.message.reply_text("Не удалось извлечь текст из PDF.")
             return
 
-        # Структуризация через OpenRouter (если ключ есть)
+        # Структуризация (если есть ключ OpenRouter)
         if OPENROUTER_API_KEY:
-            logger.info("🧠 Sending to OpenRouter...")
-            structured_text = await structure_with_openrouter(raw_text)
+            logger.info("🧠 Structuring with OpenRouter...")
+            structured = await structure_with_openrouter(raw_text)
         else:
-            logger.info("⏭️ Skipping OpenRouter")
-            structured_text = raw_text
+            structured = raw_text
 
         # Отправка TXT
-        txt_file = BytesIO(structured_text.encode("utf-8"))
-        txt_file.name = "output.txt"
-        await update.message.reply_document(document=txt_file)
-        logger.info("📤 Sent TXT file")
+        txt = BytesIO(structured.encode("utf-8"))
+        txt.name = "output.txt"
+        await update.message.reply_document(document=txt)
+        logger.info("📤 TXT sent")
 
     except Exception as e:
         logger.exception("💥 Error in handle_pdf:")
@@ -100,33 +95,37 @@ async def structure_with_openrouter(text: str) -> str:
             timeout=30
         )
         if resp.status_code == 200:
-            content = resp.json()["choices"][0]["message"]["content"].strip()
-            logger.info("✅ OpenRouter returned structured text")
-            return content
+            return resp.json()["choices"][0]["message"]["content"].strip()
         else:
-            logger.error(f"OpenRouter error: {resp.status_code} – {resp.text}")
+            logger.error(f"OpenRouter error: {resp.status_code}")
             return text
     except Exception as e:
-        logger.exception("OpenRouter request failed")
+        logger.exception("OpenRouter failed")
         return text
 
 
-# === WEBHOOK ENDPOINT ===
+# === WEBHOOK (СИНХРОННЫЙ FLASK + АСИНХРОННЫЙ TELEGRAM) ===
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put(update)
+    json_data = request.get_json(force=True)
+    if not json_
+        return "Bad Request", 400
+    update = Update.de_json(json_data, application.bot)
+    asyncio.run(process_update(update))
     return "OK", 200
 
+async def process_update(update: Update):
+    await application.process_update(update)
 
-# === УСТАНОВКА WEBHOOK ЧЕРЕЗ HTTP (СИНХРОННО) ===
+
+# === УСТАНОВКА WEBHOOK ЧЕРЕЗ HTTP ===
 def set_webhook_sync():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     resp = requests.post(url, json={"url": WEBHOOK_URL})
     if resp.ok and resp.json().get("ok"):
-        logger.info(f"✅ Webhook successfully set to: {WEBHOOK_URL}")
+        logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
     else:
-        logger.error(f"❌ Failed to set webhook: {resp.text}")
+        logger.error(f"❌ Webhook failed: {resp.text}")
 
 
 # === ЗАПУСК ===
@@ -139,7 +138,6 @@ if __name__ == "__main__":
     # Регистрируем обработчик
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
 
-    # Запуск Flask
+    # Запуск Flask на порту из Render
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"📡 Starting Flask server on port {port}")
     app.run(host="0.0.0.0", port=port, use_reloader=False)
