@@ -4,6 +4,8 @@ import logging
 import asyncio
 import requests
 import re
+import nest_asyncio
+nest_asyncio.apply()
 from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
