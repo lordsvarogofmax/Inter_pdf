@@ -1,4 +1,3 @@
-# Используем официальный Python-образ на базе Ubuntu (поддерживает apt)
 FROM python:3.12-slim
 
 # Установка системных зависимостей
@@ -11,12 +10,12 @@ RUN apt-get update && \
         libglib2.0-0 \
         && rm -rf /var/lib/apt/lists/*
 
-# Копируем зависимости
+# Установка Python-зависимостей
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
+# Копирование кода
 COPY . .
 
 # Запуск
