@@ -18,5 +18,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копирование кода
 COPY . .
 
-# Запуск
+# Запуск (обязательно!)
 CMD ["python", "main.py"]
