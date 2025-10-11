@@ -12,8 +12,11 @@ import PyPDF2
 from pdf2image import convert_from_bytes
 import pytesseract
 from PIL import Image
+from docx import Document
+from docx.shared import Pt
 from dotenv import load_dotenv
 
+# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -25,7 +28,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Пример: https://inter-pdf.onrender.com
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
@@ -34,14 +37,12 @@ if not BOT_TOKEN or not WEBHOOK_URL:
 app = Flask(__name__)
 application = None
 
-# Инициализация Application при старте
 def init_app():
     global application
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    # Инициализируем один раз
     asyncio.run(application.initialize())
     logger.info("✅ Application initialized")
 
@@ -136,7 +137,7 @@ async def improve_text_with_openrouter(text: str) -> str:
 # === ОБРАБОТЧИКИ ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Отправь PDF — я пришлю .txt с чистым текстом.")
+    await update.message.reply_text("👋 Отправь PDF — я пришлю .docx с чистым, структурированным текстом.")
 
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -154,16 +155,35 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         final_text = await improve_text_with_openrouter(raw_text)
 
-        txt = BytesIO(final_text.encode("utf-8"))
-        txt.name = "output.txt"
-        await update.message.reply_document(document=txt)
+        # Создаём .docx
+        docx_buffer = BytesIO()
+        document = Document()
+        style = document.styles['Normal']
+        font = style.font
+        font.name = 'Times New Roman'
+        font.size = Pt(12)
 
-        reply_markup = ReplyKeyboardMarkup([[KeyboardButton("📄 Отправить новый PDF")]], resize_keyboard=True, one_time_keyboard=True)
+        for para in final_text.split('\n\n'):
+            if para.strip():
+                p = document.add_paragraph(para.strip())
+                p.paragraph_format.space_after = Pt(6)
+
+        document.save(docx_buffer)
+        docx_buffer.seek(0)
+        docx_buffer.name = "output.docx"
+
+        await update.message.reply_document(document=docx_buffer)
+
+        reply_markup = ReplyKeyboardMarkup(
+            [[KeyboardButton("📄 Отправить новый PDF")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
         await update.message.reply_text("✅ Готово! Отправляй следующий PDF.", reply_markup=reply_markup)
 
     except Exception as e:
         logger.exception("💥 Ошибка в handle_pdf")
-        await update.message.reply_text("Произошла ошибка.")
+        await update.message.reply_text("Произошла ошибка при обработке файла.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📎 Пожалуйста, отправьте PDF-файл.")
@@ -176,7 +196,6 @@ def telegram_webhook():
     if not json_data:
         return "Bad Request", 400
     update = Update.de_json(json_data, application.bot)
-    # Запускаем обработку в новом event loop'е
     asyncio.run(application.process_update(update))
     return "OK", 200
 
@@ -184,9 +203,10 @@ def telegram_webhook():
 
 def set_webhook_sync():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    resp = requests.post(url, json={"url": WEBHOOK_URL + "/webhook"})
+    full_url = WEBHOOK_URL.rstrip("/") + "/webhook"
+    resp = requests.post(url, json={"url": full_url})
     if resp.ok and resp.json().get("ok"):
-        logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}/webhook")
+        logger.info(f"✅ Webhook установлен: {full_url}")
     else:
         logger.error(f"❌ Ошибка webhook: {resp.text}")
 
