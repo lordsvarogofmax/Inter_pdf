@@ -2,6 +2,9 @@ import os
 import sys
 import logging
 import asyncio
+import nest_asyncio  # ← добавлено
+nest_asyncio.apply()  # ← применено СРАЗУ после импорта
+
 import requests
 import re
 from io import BytesIO
