@@ -5,7 +5,6 @@ import asyncio
 import requests
 import re
 from io import BytesIO
-from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import PyPDF2
@@ -17,7 +16,6 @@ from docx.shared import Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from dotenv import load_dotenv
 
-# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -35,25 +33,10 @@ if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
     sys.exit(1)
 
-app = Flask(__name__)
-application = None
-
-def init_app():
-    global application
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    asyncio.run(application.initialize())
-    logger.info("✅ Application initialized")
-
-# === УМНОЕ РАЗБИЕНИЕ НА АБЗАЦЫ ===
 def split_into_paragraphs(text: str) -> list[str]:
-    # Сначала пробуем по пустым строкам
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     if len(paragraphs) > 1:
         return paragraphs
-    # Если нет — группируем по 3-5 предложений
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     grouped = []
     current = ""
@@ -67,17 +50,15 @@ def split_into_paragraphs(text: str) -> list[str]:
         grouped.append(current.strip())
     return grouped
 
-# === ОЧИСТКА ТЕКСТА ===
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r'([а-яА-Яa-zA-Z])-\n([а-яА-Яa-zA-Z])', r'\1\2', text)  # склеиваем переносы
-    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)  # заменяем одиночные \n на пробел
+    text = re.sub(r'([а-яА-Яa-zA-Z])-\n([а-яА-Яa-zA-Z])', r'\1\2', text)
+    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
     text = re.sub(r' +', ' ', text)
     text = '\n'.join(line.strip() for line in text.splitlines())
     return text.strip()
 
-# === ИЗВЛЕЧЕНИЕ ТЕКСТА (с OCR) ===
 async def extract_text_from_pdf(file_bytes: bytes) -> str:
     try:
         reader = PyPDF2.PdfReader(BytesIO(file_bytes))
@@ -102,7 +83,6 @@ async def extract_text_from_pdf(file_bytes: bytes) -> str:
         logger.exception("💥 OCR полностью провален")
         return ""
 
-# === УЛУЧШЕНИЕ ТЕКСТА ЧЕРЕЗ OPENROUTER ===
 async def improve_text_with_openrouter(text: str) -> str:
     if not OPENROUTER_API_KEY or not text.strip():
         return text
@@ -116,26 +96,25 @@ async def improve_text_with_openrouter(text: str) -> str:
 
 1. **Исправь всё**:  
    - Орфографические и пунктуационные ошибки  
-   - Случайные символы, артефакты распознавания (например: "слово^", "текст#", "123строка")  
-   - Неправильные переносы слов (например: "инфор-\nмация" → "информация")  
+   - Случайные символы, артефакты распознавания  
+   - Неправильные переносы слов  
    - Лишние или пропущенные пробелы  
    - Разорванные предложения из-за разрывов страниц
 
 2. **Восстанови структуру**:  
-   - Раздели текст на **логические абзацы** (каждый — законченная мысль)  
-   - Сохрани диалоги, если они есть (оформи их правильно, с новой строки и тире)  
-   - Не добавляй заголовков, если их не было в оригинале  
-   - Не сокращай и не расширяй содержание — только редактируй
+   - Раздели текст на **логические абзацы**  
+   - Сохрани диалоги, если они есть  
+   - Не добавляй заголовков, если их не было  
+   - Не сокращай и не расширяй содержание
 
 3. **Стиль и язык**:  
-   - Сохрани оригинальный стиль (художественный, научный, публицистический и т.д.)  
-   - Используй литературный русский язык  
-   - Убедись, что ударения расставлены правильно **внутри слов** (но не ставь знаки ударения — просто пиши правильно: "звонит", а не "звОнит")
+   - Сохрани оригинальный стиль  
+   - Используй литературный русский язык
 
 4. **Формат вывода**:  
    - Верни **только итоговый текст**  
-   - Без пояснений, комментариев, заголовков вроде "Исправленный текст:"  
-   - Без markdown, без форматирования — только чистый текст с переносами строк между абзацами
+   - Без пояснений, комментариев  
+   - Без markdown — только чистый текст с переносами строк между абзацами
 
 Текст:
 {text}
@@ -156,9 +135,8 @@ async def improve_text_with_openrouter(text: str) -> str:
         logger.exception("OpenRouter недоступен")
         return text
 
-# === ОБРАБОТЧИКИ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Отправь PDF — я пришлю .docx с чистым, структурированным текстом.")
+    await update.message.reply_text("👋 Отправь PDF — я пришлю .docx с чистым текстом.")
 
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -176,7 +154,6 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         final_text = await improve_text_with_openrouter(raw_text)
 
-        # Создаём .docx
         docx_buffer = BytesIO()
         document = Document()
         style = document.styles['Normal']
@@ -196,7 +173,6 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         document.save(docx_buffer)
         docx_buffer.seek(0)
         docx_buffer.name = "output.docx"
-
         await update.message.reply_document(document=docx_buffer)
 
         reply_markup = ReplyKeyboardMarkup(
@@ -208,36 +184,32 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("💥 Ошибка в handle_pdf")
-        await update.message.reply_text("Произошла ошибка при обработке файла.")
+        await update.message.reply_text("Произошла ошибка.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📎 Пожалуйста, отправьте PDF-файл.")
 
-# === WEBHOOK ===
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    json_data = request.get_json(force=True)
-    if not json_data:
-        return "Bad Request", 400
-    update = Update.de_json(json_data, application.bot)
-    asyncio.run(application.process_update(update))
-    return "OK", 200
-
-# === УСТАНОВКА WEBHOOK ===
-def set_webhook_sync():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    full_url = WEBHOOK_URL.rstrip("/") + "/webhook"
-    resp = requests.post(url, json={"url": full_url})
-    if resp.ok and resp.json().get("ok"):
-        logger.info(f"✅ Webhook установлен: {full_url}")
-    else:
-        logger.error(f"❌ Ошибка webhook: {resp.text}")
-
-# === ЗАПУСК ===
-if __name__ == "__main__":
+async def main():
     logger.info("🚀 Запуск бота...")
-    init_app()
-    set_webhook_sync()
+
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+    webhook_path = "/webhook"
+    full_webhook_url = WEBHOOK_URL.rstrip("/") + webhook_path
+
+    await application.bot.set_webhook(url=full_webhook_url)
+    logger.info(f"✅ Webhook установлен: {full_webhook_url}")
+
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_url=full_webhook_url,
+        secret_token=None
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
