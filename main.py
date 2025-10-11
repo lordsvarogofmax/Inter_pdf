@@ -14,6 +14,7 @@ import pytesseract
 from PIL import Image
 from docx import Document
 from docx.shared import Pt
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from dotenv import load_dotenv
 
 # === ЛОГИРОВАНИЕ ===
@@ -46,17 +47,37 @@ def init_app():
     asyncio.run(application.initialize())
     logger.info("✅ Application initialized")
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+# === УМНОЕ РАЗБИЕНИЕ НА АБЗАЦЫ ===
+def split_into_paragraphs(text: str) -> list[str]:
+    # Сначала пробуем по пустым строкам
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    if len(paragraphs) > 1:
+        return paragraphs
+    # Если нет — группируем по 3-5 предложений
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    grouped = []
+    current = ""
+    for sentence in sentences:
+        if len(current) + len(sentence) < 300:
+            current += sentence + " "
+        else:
+            grouped.append(current.strip())
+            current = sentence + " "
+    if current:
+        grouped.append(current.strip())
+    return grouped
 
+# === ОЧИСТКА ТЕКСТА ===
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r'([а-яА-Яa-zA-Z])-\n([а-яА-Яa-zA-Z])', r'\1\2', text)
-    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+    text = re.sub(r'([а-яА-Яa-zA-Z])-\n([а-яА-Яa-zA-Z])', r'\1\2', text)  # склеиваем переносы
+    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)  # заменяем одиночные \n на пробел
     text = re.sub(r' +', ' ', text)
     text = '\n'.join(line.strip() for line in text.splitlines())
     return text.strip()
 
+# === ИЗВЛЕЧЕНИЕ ТЕКСТА (с OCR) ===
 async def extract_text_from_pdf(file_bytes: bytes) -> str:
     try:
         reader = PyPDF2.PdfReader(BytesIO(file_bytes))
@@ -81,6 +102,7 @@ async def extract_text_from_pdf(file_bytes: bytes) -> str:
         logger.exception("💥 OCR полностью провален")
         return ""
 
+# === УЛУЧШЕНИЕ ТЕКСТА ЧЕРЕЗ OPENROUTER ===
 async def improve_text_with_openrouter(text: str) -> str:
     if not OPENROUTER_API_KEY or not text.strip():
         return text
@@ -135,7 +157,6 @@ async def improve_text_with_openrouter(text: str) -> str:
         return text
 
 # === ОБРАБОТЧИКИ ===
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Отправь PDF — я пришлю .docx с чистым, структурированным текстом.")
 
@@ -163,10 +184,14 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         font.name = 'Times New Roman'
         font.size = Pt(12)
 
-        for para in final_text.split('\n\n'):
+        paragraphs = split_into_paragraphs(final_text)
+        for para in paragraphs:
             if para.strip():
                 p = document.add_paragraph(para.strip())
                 p.paragraph_format.space_after = Pt(6)
+                p.paragraph_format.space_before = Pt(6)
+                p.paragraph_format.line_spacing = 1.15
+                p.paragraph_format.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
 
         document.save(docx_buffer)
         docx_buffer.seek(0)
@@ -189,7 +214,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📎 Пожалуйста, отправьте PDF-файл.")
 
 # === WEBHOOK ===
-
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     json_data = request.get_json(force=True)
@@ -200,7 +224,6 @@ def telegram_webhook():
     return "OK", 200
 
 # === УСТАНОВКА WEBHOOK ===
-
 def set_webhook_sync():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     full_url = WEBHOOK_URL.rstrip("/") + "/webhook"
@@ -211,7 +234,6 @@ def set_webhook_sync():
         logger.error(f"❌ Ошибка webhook: {resp.text}")
 
 # === ЗАПУСК ===
-
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
     init_app()
