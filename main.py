@@ -4,8 +4,6 @@ import logging
 import asyncio
 import requests
 import re
-import nest_asyncio
-nest_asyncio.apply()
 from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -16,8 +14,8 @@ from PIL import Image
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from dotenv import load_dotenv
 
+# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -25,15 +23,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
-
+# === ПЕРЕМЕННЫЕ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Пример: https://inter-pdf.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Пример: https://docker-5k7y.onrender.com
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
     sys.exit(1)
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
 def split_into_paragraphs(text: str) -> list[str]:
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
@@ -137,8 +136,10 @@ async def improve_text_with_openrouter(text: str) -> str:
         logger.exception("OpenRouter недоступен")
         return text
 
+# === ОБРАБОТЧИКИ ===
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Отправь PDF — я пришлю .docx с чистым текстом.")
+    await update.message.reply_text("👋 Отправь PDF — я пришлю .docx с чистым, структурированным текстом.")
 
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -186,10 +187,12 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("💥 Ошибка в handle_pdf")
-        await update.message.reply_text("Произошла ошибка.")
+        await update.message.reply_text("Произошла ошибка при обработке файла.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📎 Пожалуйста, отправьте PDF-файл.")
+
+# === ЗАПУСК ===
 
 async def main():
     logger.info("🚀 Запуск бота...")
@@ -206,11 +209,11 @@ async def main():
     await application.bot.set_webhook(url=full_webhook_url)
     logger.info(f"✅ Webhook установлен: {full_webhook_url}")
 
+    # Этот вызов БЛОКИРУЕТ выполнение и держит сервер включённым
     await application.run_webhook(
         listen="0.0.0.0",
         port=port,
-        webhook_url=full_webhook_url,
-        secret_token=None
+        webhook_url=full_webhook_url
     )
 
 if __name__ == "__main__":
