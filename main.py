@@ -212,10 +212,17 @@ def telegram_webhook():
     json_data = request.get_json(force=True)
     if not json_data:
         return "Bad Request", 400
-    application = get_application()
-    update = Update.de_json(json_data, application.bot)
-    asyncio.run(application.process_update(update))
-    return "OK", 200
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        application = get_application()
+        update = Update.de_json(json_data, application.bot)
+        loop.run_until_complete(application.process_update(update))
+        return "OK", 200
+    finally:
+        loop.close()
 
 # === УСТАНОВКА WEBHOOK ===
 
