@@ -2,12 +2,10 @@ import os
 import sys
 import logging
 import asyncio
-import nest_asyncio  # ← добавлено
-nest_asyncio.apply()  # ← применено СРАЗУ после импорта
-
 import requests
 import re
 from io import BytesIO
+from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import PyPDF2
@@ -18,7 +16,6 @@ from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
-# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -26,14 +23,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# === ПЕРЕМЕННЫЕ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Пример: https://docker-5k7y.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
     sys.exit(1)
+
+app = Flask(__name__)
+_bot_app = None
+
+def get_application():
+    global _bot_app
+    if _bot_app is None:
+        _bot_app = Application.builder().token(BOT_TOKEN).build()
+        _bot_app.add_handler(CommandHandler("start", start))
+        _bot_app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+        _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        asyncio.run(_bot_app.initialize())
+        logger.info("✅ Application initialized")
+    return _bot_app
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
@@ -195,29 +205,34 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📎 Пожалуйста, отправьте PDF-файл.")
 
+# === WEBHOOK ===
+
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    json_data = request.get_json(force=True)
+    if not json_data:
+        return "Bad Request", 400
+    application = get_application()
+    update = Update.de_json(json_data, application.bot)
+    asyncio.run(application.process_update(update))
+    return "OK", 200
+
+# === УСТАНОВКА WEBHOOK ===
+
+def set_webhook_sync():
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+    full_url = WEBHOOK_URL.rstrip("/") + "/webhook"
+    resp = requests.post(url, json={"url": full_url})
+    if resp.ok and resp.json().get("ok"):
+        logger.info(f"✅ Webhook установлен: {full_url}")
+    else:
+        logger.error(f"❌ Ошибка webhook: {resp.text}")
+
 # === ЗАПУСК ===
 
-async def main():
+if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
-
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    set_webhook_sync()
 
     port = int(os.environ.get("PORT", 10000))
-    webhook_path = "/webhook"
-    full_webhook_url = WEBHOOK_URL.rstrip("/") + webhook_path
-
-    await application.bot.set_webhook(url=full_webhook_url)
-    logger.info(f"✅ Webhook установлен: {full_webhook_url}")
-
-    # Этот вызов БЛОКИРУЕТ выполнение и держит сервер включённым
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        webhook_url=full_webhook_url
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
