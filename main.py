@@ -213,6 +213,7 @@ def telegram_webhook():
     if not json_data:
         return "Bad Request", 400
 
+    # Создаём новый event loop для обработки
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
