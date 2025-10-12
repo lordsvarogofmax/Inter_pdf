@@ -45,8 +45,6 @@ def get_application():
         logger.info("✅ Application initialized")
     return _bot_app
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
-
 def split_into_paragraphs(text: str) -> list[str]:
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     if len(paragraphs) > 1:
@@ -149,8 +147,6 @@ async def improve_text_with_openrouter(text: str) -> str:
         logger.exception("OpenRouter недоступен")
         return text
 
-# === ОБРАБОТЧИКИ ===
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Отправь PDF — я пришлю .docx с чистым, структурированным текстом.")
 
@@ -205,15 +201,12 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📎 Пожалуйста, отправьте PDF-файл.")
 
-# === WEBHOOK ===
-
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     json_data = request.get_json(force=True)
     if not json_data:
         return "Bad Request", 400
 
-    # Создаём новый event loop для обработки
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -225,8 +218,6 @@ def telegram_webhook():
     finally:
         loop.close()
 
-# === УСТАНОВКА WEBHOOK ===
-
 def set_webhook_sync():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     full_url = WEBHOOK_URL.rstrip("/") + "/webhook"
@@ -235,8 +226,6 @@ def set_webhook_sync():
         logger.info(f"✅ Webhook установлен: {full_url}")
     else:
         logger.error(f"❌ Ошибка webhook: {resp.text}")
-
-# === ЗАПУСК ===
 
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
