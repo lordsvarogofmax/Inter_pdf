@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 # === ПЕРЕМЕННЫЕ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN or not WEBHOOK_URL:
@@ -31,18 +30,18 @@ if not BOT_TOKEN or not WEBHOOK_URL:
     sys.exit(1)
 
 app = Flask(__name__)
-_bot_app = None
+application = None  # будет инициализирован один раз
 
-def get_application():
-    global _bot_app
-    if _bot_app is None:
-        _bot_app = Application.builder().token(BOT_TOKEN).build()
-        _bot_app.add_handler(CommandHandler("start", start))
-        _bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-        _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-        asyncio.run(_bot_app.initialize())
+# === ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ===
+def init_application():
+    global application
+    if application is None:
+        application = Application.builder().token(BOT_TOKEN).build()
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        asyncio.run(application.initialize())
         logger.info("✅ Application initialized")
-    return _bot_app
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
@@ -175,7 +174,6 @@ def telegram_webhook():
     from telegram import Update
 
     async def handle():
-        application = get_application()
         update = Update.de_json(json_data, application.bot)
         await application.process_update(update)
 
@@ -202,6 +200,7 @@ def set_webhook_sync():
 
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
+    init_application()  # ← инициализация ДО set_webhook и Flask
     set_webhook_sync()
 
     port = int(os.environ.get("PORT", 10000))
