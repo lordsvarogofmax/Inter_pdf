@@ -1,7 +1,6 @@
 import os
 import sys
 import logging
-import asyncio
 import requests
 import re
 from io import BytesIO
@@ -30,20 +29,28 @@ if not BOT_TOKEN or not WEBHOOK_URL:
     sys.exit(1)
 
 app = Flask(__name__)
-application = None  # будет инициализирован один раз
-
-# === ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ===
-def init_application():
-    global application
-    if application is None:
-        application = Application.builder().token(BOT_TOKEN).build()
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-        asyncio.run(application.initialize())
-        logger.info("✅ Application initialized")
+application = None
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+def send_message(chat_id: int, text: str, reply_markup=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        data["reply_markup"] = reply_markup.to_dict()
+    try:
+        requests.post(url, json=data, timeout=10)
+    except Exception as e:
+        logger.exception("Ошибка отправки сообщения")
+
+def send_document(chat_id: int, file_buffer: BytesIO, filename: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    files = {"document": (filename, file_buffer, "text/plain")}
+    data = {"chat_id": chat_id}
+    try:
+        requests.post(url, files=files, data=data, timeout=60)
+    except Exception as e:
+        logger.exception("Ошибка отправки документа")
 
 def clean_text(text: str) -> str:
     if not text:
@@ -54,7 +61,7 @@ def clean_text(text: str) -> str:
     text = '\n'.join(line.strip() for line in text.splitlines())
     return text.strip()
 
-async def extract_text_from_pdf(file_bytes: bytes, is_ocr_needed: bool = False) -> str:
+def extract_text_from_pdf(file_bytes: bytes, is_ocr_needed: bool = False) -> str:
     if not is_ocr_needed:
         try:
             reader = PyPDF2.PdfReader(BytesIO(file_bytes))
@@ -80,38 +87,38 @@ async def extract_text_from_pdf(file_bytes: bytes, is_ocr_needed: bool = False) 
         logger.exception("💥 OCR полностью провален")
         raise
 
-# === ОБРАБОТЧИКИ ===
+# === ОБРАБОТЧИКИ (СИНХРОННЫЕ) ===
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start(update: Update, context):
     reply_markup = ReplyKeyboardMarkup(
         [[KeyboardButton("📤 Отправить PDF на конвертацию")]],
         resize_keyboard=True,
         one_time_keyboard=False
     )
-    await update.message.reply_text(
-        "👋 Привет! Я бот для конвертации PDF в текст.\n\n"
-        "Нажмите кнопку ниже, чтобы начать.",
-        reply_markup=reply_markup
+    send_message(
+        update.effective_chat.id,
+        "👋 Привет! Я бот для конвертации PDF в текст.\n\nНажмите кнопку ниже, чтобы начать.",
+        reply_markup
     )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📎 Я работаю только с PDF-файлами.\n\n"
-        "Пожалуйста, отправьте PDF или нажмите кнопку «📤 Отправить PDF на конвертацию»."
+def handle_text(update: Update, context):
+    send_message(
+        update.effective_chat.id,
+        "📎 Я работаю только с PDF-файлами.\n\nПожалуйста, отправьте PDF или нажмите кнопку «📤 Отправить PDF на конвертацию»."
     )
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_document(update: Update, context):
     doc = update.message.document
 
     if doc.mime_type != "application/pdf":
-        await update.message.reply_text("❌ Я принимаю только PDF-файлы. Пожалуйста, отправьте PDF.")
+        send_message(update.effective_chat.id, "❌ Я принимаю только PDF-файлы. Пожалуйста, отправьте PDF.")
         return
 
-    await update.message.reply_text("⏳ Принял PDF. Начинаю обработку...")
+    send_message(update.effective_chat.id, "⏳ Принял PDF. Начинаю обработку...")
 
     try:
-        file = await doc.get_file()
-        file_bytes = await file.download_as_bytearray()
+        file = update.message.bot.get_file(doc.file_id)
+        file_bytes = file.download_as_bytearray()
         logger.info(f"📥 Получен PDF: {doc.file_name or 'без имени'}, {len(file_bytes)} байт")
 
         # Проверим, текстовый ли PDF
@@ -123,18 +130,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_ocr_needed = True
 
         if is_ocr_needed:
-            await update.message.reply_text(
+            send_message(
+                update.effective_chat.id,
                 "🔍 Обнаружен скан или изображение. Использую OCR (распознавание текста с картинок).\n"
                 "Это может занять 30–60 секунд. Пожалуйста, подождите..."
             )
 
-        text = await extract_text_from_pdf(file_bytes, is_ocr_needed=is_ocr_needed)
+        text = extract_text_from_pdf(file_bytes, is_ocr_needed=is_ocr_needed)
 
         if not text.strip():
-            await update.message.reply_text("❌ Не удалось извлечь текст из PDF. Возможно, файл повреждён или пуст.")
+            send_message(update.effective_chat.id, "❌ Не удалось извлечь текст из PDF. Возможно, файл повреждён или пуст.")
             return
 
-        # Имя файла: исходное имя PDF → .txt
         base_name = doc.file_name
         if base_name:
             txt_name = os.path.splitext(base_name)[0] + ".txt"
@@ -142,27 +149,37 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt_name = "converted.txt"
 
         txt_buffer = BytesIO(text.encode("utf-8"))
-        txt_buffer.name = txt_name
-        await update.message.reply_document(document=txt_buffer)
+        send_document(update.effective_chat.id, txt_buffer, txt_name)
 
         reply_markup = ReplyKeyboardMarkup(
             [[KeyboardButton("📤 Отправить PDF на конвертацию")]],
             resize_keyboard=True,
             one_time_keyboard=False
         )
-        await update.message.reply_text(
-            "✅ Готово! Текст успешно извлечён.\n\n"
-            "Отправляйте следующий PDF!",
-            reply_markup=reply_markup
+        send_message(
+            update.effective_chat.id,
+            "✅ Готово! Текст успешно извлечён.\n\nОтправляйте следующий PDF!",
+            reply_markup
         )
 
     except Exception as e:
         logger.exception("💥 Ошибка при обработке PDF")
-        await update.message.reply_text(
+        send_message(
+            update.effective_chat.id,
             "❌ Произошла ошибка при конвертации. Попробуйте снова или отправьте другой PDF."
         )
 
-# === WEBHOOK ===
+# === ИНИЦИАЛИЗАЦИЯ И WEBHOOK ===
+
+def init_application():
+    global application
+    if application is None:
+        application = Application.builder().token(BOT_TOKEN).build()
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+        application.initialize()
+        logger.info("✅ Application initialized")
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -170,22 +187,9 @@ def telegram_webhook():
     if not json_data:
         return "Bad Request", 400
 
-    import asyncio
-    from telegram import Update
-
-    async def handle():
-        update = Update.de_json(json_data, application.bot)
-        await application.process_update(update)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(handle())
-        return "OK", 200
-    finally:
-        loop.close()
-
-# === УСТАНОВКА WEBHOOK ===
+    update = Update.de_json(json_data, application.bot)
+    application.process_update(update)
+    return "OK", 200
 
 def set_webhook_sync():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
@@ -196,11 +200,9 @@ def set_webhook_sync():
     else:
         logger.error(f"❌ Ошибка webhook: {resp.text}")
 
-# === ЗАПУСК ===
-
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
-    init_application()  # ← инициализация ДО set_webhook и Flask
+    init_application()
     set_webhook_sync()
 
     port = int(os.environ.get("PORT", 10000))
