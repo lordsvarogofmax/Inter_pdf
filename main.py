@@ -93,8 +93,8 @@ def clean_text(text):
     text = '\n'.join(line.strip() for line in text.splitlines())
     return text.strip()
 
-def extract_text_from_pdf(file_bytes, is_ocr_needed=False):
-    """Извлекает текст из PDF с улучшенной обработкой ошибок"""
+def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=None):
+    """Извлекает текст из PDF с улучшенной обработкой ошибок и прогрессом"""
     if not is_ocr_needed:
         try:
             reader = PyPDF2.PdfReader(BytesIO(file_bytes))
@@ -107,14 +107,57 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False):
 
     logger.info("🖼️ Запуск OCR...")
     try:
-        images = convert_from_bytes(file_bytes, dpi=200)
+        # Ограничиваем количество страниц и уменьшаем DPI для экономии памяти
+        images = convert_from_bytes(
+            file_bytes, 
+            dpi=150,  # Уменьшили с 200 до 150
+            first_page=1, 
+            last_page=10  # Максимум 10 страниц
+        )
+        
+        if len(images) > 10:
+            logger.warning(f"⚠️ Файл содержит больше 10 страниц. Обрабатываю только первые 10.")
+            if progress_callback:
+                progress_callback("⚠️ Обрабатываю только первые 10 страниц из-за ограничений")
+        
         ocr_text = ""
         for i, img in enumerate(images):
-            logger.info(f"🔍 Обрабатываю страницу {i+1}/{len(images)}")
-            text = pytesseract.image_to_string(img, lang='rus+eng')
-            ocr_text += text + "\n"
+            if progress_callback:
+                progress_callback(f"🔍 Обрабатываю страницу {i+1}/{len(images)}")
+            else:
+                logger.info(f"🔍 Обрабатываю страницу {i+1}/{len(images)}")
+            
+            try:
+                # Уменьшаем размер изображения для экономии памяти
+                if img.width > 2000 or img.height > 2000:
+                    img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                    logger.info(f"📏 Уменьшил изображение до {img.size}")
+                
+                # Улучшенные параметры OCR
+                text = pytesseract.image_to_string(
+                    img, 
+                    lang='rus+eng',
+                    config='--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя.,!?;:()[]{}"\'`~@#$%^&*+=|\\/<>-_ '
+                )
+                ocr_text += text + "\n"
+                
+                if progress_callback:
+                    progress_callback(f"✅ Страница {i+1} завершена")
+                else:
+                    logger.info(f"✅ Страница {i+1} завершена")
+                
+                # Небольшая пауза между страницами для стабильности
+                time.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
+                if progress_callback:
+                    progress_callback(f"❌ Ошибка на странице {i+1}, пропускаю")
+                continue
+                
         logger.info("✅ OCR завершен успешно")
         return clean_text(ocr_text)
+        
     except Exception as e:
         logger.exception("💥 OCR провален")
         raise
@@ -157,6 +200,8 @@ def telegram_webhook():
                     "👋 Привет! Я бот для конвертации PDF в текст.\n\nНажмите кнопку ниже, чтобы начать.",
                     reply_markup
                 )
+            elif text == "/stop":
+                send_message(chat_id, "🛑 Бот остановлен. Используйте /start для перезапуска.")
             else:
                 send_message(
                     chat_id,
@@ -167,6 +212,15 @@ def telegram_webhook():
             if doc.get("mime_type") != "application/pdf":
                 send_message(chat_id, "❌ Я принимаю только PDF-файлы.")
                 return "OK", 200
+
+            # Проверяем размер файла
+            file_size = doc.get("file_size", 0)
+            if file_size > 50 * 1024 * 1024:  # 50 МБ
+                send_message(chat_id, "❌ Файл слишком большой для обработки. Максимальный размер: 50 МБ")
+                return "OK", 200
+            
+            if file_size > 10 * 1024 * 1024:  # 10 МБ
+                send_message(chat_id, "⚠️ Большой файл. Обработка может занять несколько минут...")
 
             send_message(chat_id, "⏳ Принял PDF. Начинаю обработку...")
 
@@ -183,7 +237,7 @@ def telegram_webhook():
                 file_path = resp.json()["result"]["file_path"]
                 file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
                 
-                file_resp = requests.get(file_url, timeout=30)
+                file_resp = requests.get(file_url, timeout=60)  # Увеличили таймаут для больших файлов
                 if not file_resp.ok:
                     logger.error(f"❌ Ошибка скачивания файла: {file_resp.status_code}")
                     send_message(chat_id, "❌ Ошибка скачивания файла.")
@@ -205,10 +259,14 @@ def telegram_webhook():
                 if is_ocr_needed:
                     send_message(
                         chat_id,
-                        "🔍 Обнаружен скан. Использую OCR. Это займёт 30–60 секунд..."
+                        "🔍 Обнаружен скан. Использую OCR. Это займёт 1-3 минуты..."
                     )
 
-                text = extract_text_from_pdf(file_bytes, is_ocr_needed=is_ocr_needed)
+                # Функция для отправки прогресса
+                def progress_callback(message):
+                    logger.info(f"📊 {message}")
+
+                text = extract_text_from_pdf(file_bytes, is_ocr_needed=is_ocr_needed, progress_callback=progress_callback)
                 if not text.strip():
                     send_message(chat_id, "❌ Не удалось извлечь текст.")
                     return "OK", 200
