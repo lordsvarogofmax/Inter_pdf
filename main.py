@@ -133,12 +133,23 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
                     img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
                     logger.info(f"📏 Уменьшил изображение до {img.size}")
                 
-                # Улучшенные параметры OCR
-                text = pytesseract.image_to_string(
-                    img, 
-                    lang='rus+eng',
-                    config='--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя.,!?;:()[]{}"\'`~@#$%^&*+=|\\/<>-_ '
-                )
+                # Улучшенные параметры OCR с fallback
+                try:
+                    # Сначала пробуем с whitelist
+                    text = pytesseract.image_to_string(
+                        img, 
+                        lang='rus+eng',
+                        config='--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя.,!?;:()[]{}\"\'`~@#$%^&*+=|\\/<>-_ '
+                    )
+                except Exception as whitelist_error:
+                    logger.warning(f"⚠️ Ошибка с whitelist, пробую без него: {whitelist_error}")
+                    # Fallback без whitelist
+                    text = pytesseract.image_to_string(
+                        img, 
+                        lang='rus+eng',
+                        config='--psm 6 --oem 3'
+                    )
+                
                 ocr_text += text + "\n"
                 
                 if progress_callback:
