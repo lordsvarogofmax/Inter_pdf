@@ -493,9 +493,9 @@ def preprocess_image_for_ocr(img_pil):
     else:
         gray = img_cv
     
-    # Масштабирование в первую очередь для лучшего качества
-    scale_factor = 3.0  # Увеличиваем масштаб для лучшего распознавания
-    if gray.shape[0] < 2000 or gray.shape[1] < 2000:
+    # Оптимизированное масштабирование для Render (ограниченная память)
+    scale_factor = 2.0  # Уменьшаем масштаб для экономии памяти
+    if gray.shape[0] < 1500 or gray.shape[1] < 1500:
         new_width = int(gray.shape[1] * scale_factor)
         new_height = int(gray.shape[0] * scale_factor)
         gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
@@ -649,106 +649,143 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
         lp = last_page if last_page is not None else max_pages_default
         if lp < fp:
             fp, lp = lp, fp
-        # Увеличиваем DPI для лучшего качества, но ограничиваем размер
-        images = convert_from_bytes(file_bytes, dpi=250, first_page=fp, last_page=lp)
-        
-        ocr_text = ""
-        # Параллельное распознавание страниц для ускорения
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Обрабатываем большие файлы по частям для экономии памяти
+        total_pages = lp - fp + 1
+        if total_pages > 5:  # Если больше 5 страниц, обрабатываем по частям
+            logger.info(f"📄 Большой файл ({total_pages} страниц), обрабатываем по частям...")
+            ocr_text = ""
+            chunk_size = 3  # По 3 страницы за раз
+            
+            for start_page in range(fp, lp + 1, chunk_size):
+                end_page = min(start_page + chunk_size - 1, lp)
+                logger.info(f"🔄 Обрабатываем страницы {start_page}-{end_page}...")
+                
+                # Конвертируем только текущую часть
+                chunk_images = convert_from_bytes(file_bytes, dpi=200, first_page=start_page, last_page=end_page)
+                
+                # Обрабатываем часть
+                chunk_text = process_image_chunk(chunk_images, progress_callback)
+                ocr_text += chunk_text + "\n"
+                
+                # Освобождаем память
+                del chunk_images
+                
+            return clean_text(ocr_text)
+        else:
+            # Обычная обработка для небольших файлов
+            images = convert_from_bytes(file_bytes, dpi=200, first_page=fp, last_page=lp)
+            return process_image_chunk(images, progress_callback)
+    except Exception as e:
+        logger.exception("💥 OCR провален")
+        raise
 
-        def ocr_single(idx_img):
-            i, img = idx_img
-            try:
-                # Оптимизируем размер изображения для баланса качества и скорости
-                if img.width > 2500 or img.height > 2500:
-                    img.thumbnail((2500, 2500), Image.Resampling.LANCZOS)
-                
-                # Расширенный whitelist для лучшего распознавания
-                safe_whitelist = (
-                    "0123456789"
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    "abcdefghijklmnopqrstuvwxyz"
-                    "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-                    "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-                    ".,:;!?()\-–—_№%$€₽«»""''"
-                )
-                
-                # Множественные конфигурации для разных типов документов
-                configs = [
-                    # Для обычного текста
-                    f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
-                    # Для блочного текста
-                    f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
-                    # Для одной колонки
-                    f"--psm 3 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
-                    # Для таблиц и форм
-                    f"--psm 8 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
-                    # Без whitelist для сложных случаев
-                    "--psm 6 --oem 3 -c preserve_interword_spaces=1",
-                    "--psm 4 --oem 3 -c preserve_interword_spaces=1"
-                ]
-                
-                # Получаем варианты изображения для OCR
-                img_variants = enhance_ocr_with_alternatives(img)
-                
-                text = ""
-                best_text = ""
-                max_length = 0
-                
-                # Пробуем все комбинации вариантов изображения и конфигураций
-                for variant_name, variant_img in img_variants:
-                    for config in configs:
-                        try:
-                            result = pytesseract.image_to_string(
-                                variant_img,
-                                lang='rus+eng',
-                                config=config
-                            )
+def process_image_chunk(images, progress_callback=None):
+    """Обрабатывает часть изображений для OCR"""
+    ocr_text = ""
+    # Параллельное распознавание страниц для ускорения
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def ocr_single(idx_img):
+        i, img = idx_img
+        try:
+            # Оптимизируем размер изображения для Render (ограниченная память)
+            if img.width > 2000 or img.height > 2000:
+                img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+            
+            # Расширенный whitelist для лучшего распознавания
+            safe_whitelist = (
+                "0123456789"
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz"
+                "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+                "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+                ".,:;!?()\-–—_№%$€₽«»""''"
+            )
+            
+            # Множественные конфигурации для разных типов документов
+            configs = [
+                # Для обычного текста
+                f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                # Для блочного текста
+                f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                # Для одной колонки
+                f"--psm 3 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                # Для таблиц и форм
+                f"--psm 8 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
+                # Без whitelist для сложных случаев
+                "--psm 6 --oem 3 -c preserve_interword_spaces=1",
+                "--psm 4 --oem 3 -c preserve_interword_spaces=1"
+            ]
+            
+            # Получаем варианты изображения для OCR
+            img_variants = enhance_ocr_with_alternatives(img)
+            
+            text = ""
+            best_text = ""
+            max_length = 0
+            
+            # Пробуем все комбинации вариантов изображения и конфигураций
+            for variant_name, variant_img in img_variants:
+                for config in configs:
+                    try:
+                        result = pytesseract.image_to_string(
+                            variant_img,
+                            lang='rus+eng',
+                            config=config
+                        )
+                        
+                        if result.strip():
+                            # Выбираем результат с наибольшим количеством символов
+                            if len(result.strip()) > max_length:
+                                max_length = len(result.strip())
+                                best_text = result
                             
-                            if result.strip():
-                                # Выбираем результат с наибольшим количеством символов
-                                if len(result.strip()) > max_length:
-                                    max_length = len(result.strip())
-                                    best_text = result
+                            # Если результат достаточно хорош, используем его
+                            if len(result.strip()) > 100:  # Минимум 100 символов
+                                text = result
+                                logger.info(f"✅ Найден хороший результат с {variant_name} и конфигом {config[:20]}...")
+                                break
                                 
-                                # Если результат достаточно хорош, используем его
-                                if len(result.strip()) > 100:  # Минимум 100 символов
-                                    text = result
-                                    logger.info(f"✅ Найден хороший результат с {variant_name} и конфигом {config[:20]}...")
-                                    break
-                                    
-                        except Exception as e:
-                            logger.warning(f"⚠️ Ошибка OCR с {variant_name} и конфигом {config[:20]}: {e}")
-                            continue
-                    
-                    if text.strip():  # Если нашли хороший результат, прерываем
-                        break
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка OCR с {variant_name} и конфигом {config[:20]}: {e}")
+                        continue
                 
-                # Если не нашли хороший результат, используем лучший из всех
-                if not text.strip() and best_text.strip():
-                    text = best_text
-                    logger.info(f"✅ Используем лучший результат из всех попыток ({max_length} символов)")
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
-                text = ""
-            return i, text
+                if text.strip():  # Если нашли хороший результат, прерываем
+                    break
+            
+            # Если не нашли хороший результат, используем лучший из всех
+            if not text.strip() and best_text.strip():
+                text = best_text
+                logger.info(f"✅ Используем лучший результат из всех попыток ({max_length} символов)")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
+            text = ""
+        return i, text
 
-        with ThreadPoolExecutor(max_workers=min(8, len(images))) as executor:
-            futures = {executor.submit(ocr_single, (i, img)): i for i, img in enumerate(images)}
-            for fut in as_completed(futures):
+    # Уменьшаем количество потоков для Render (ограниченная память)
+    max_workers = min(3, len(images))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(ocr_single, (i, img)): i for i, img in enumerate(images)}
+        
+        # Добавляем таймаут для предотвращения зависания
+        from concurrent.futures import TimeoutError
+        for fut in as_completed(futures, timeout=300):  # 5 минут на страницу
+            try:
                 i, text = fut.result()
                 if progress_callback:
                     progress_callback(f"✅ Страница {i+1} завершена")
                 else:
                     logger.info(f"✅ Страница {i+1} завершена")
                 ocr_text += text + "\n"
-        logger.info("✅ OCR завершен успешно")
-        return clean_text(ocr_text)
-        
-    except Exception as e:
-        logger.exception("💥 OCR провален")
-        raise
+            except TimeoutError:
+                logger.error("⏰ Таймаут обработки страницы")
+                continue
+            except Exception as e:
+                logger.error(f"❌ Ошибка обработки страницы: {e}")
+                continue
+    logger.info("✅ OCR завершен успешно")
+    return clean_text(ocr_text)
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
