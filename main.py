@@ -34,6 +34,9 @@ processed_messages = set()
 # Состояния пользователей (ожидают ли они загрузки файла)
 user_states = {}
 
+# Временное хранилище для больших OCR-PDF, ожидающих выбора пользователя
+pending_files = {}
+
 # Основное описание бота для показа по кнопке
 DESCRIPTION_MESSAGE = (
     "Описание бота (PDF → Текст)\n\n"
@@ -140,6 +143,28 @@ def send_document(chat_id, file_buffer, filename):
     except Exception as e:
         logger.exception("💥 Ошибка при отправке документа")
 
+def answer_callback_query(callback_query_id, text=None):
+    """Отвечает на callback-запрос для снятия индикатора загрузки на кнопке"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
+        data = {"callback_query_id": callback_query_id}
+        if text:
+            data["text"] = text
+        response = requests.post(url, data=data, timeout=10)
+        if not response.ok:
+            logger.error(f"❌ Ошибка answerCallbackQuery: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.exception("💥 Ошибка при answerCallbackQuery")
+
+def build_split_options_keyboard():
+    """Создает inline-клавиатуру с вариантами обработки большого OCR-PDF"""
+    return {
+        "inline_keyboard": [[
+            {"text": "✂️ разделить файл", "callback_data": "SPLIT_PDF"},
+            {"text": "🔟 распознать только первые 10 страниц", "callback_data": "OCR_FIRST_10"}
+        ]]
+    }
+
 def clean_text(text):
     """Очищает извлеченный текст"""
     if not text:
@@ -165,7 +190,7 @@ def handle_file_questions(text):
         return """📋 **Информация о файлах:**
 
 ✅ **Принимаемые форматы:** Только PDF файлы
-📏 **Максимальный размер:** 50 МБ
+📏 **Максимальный размер:** 20 МБ
 ⏱️ **Время обработки:** 
    • Текстовые PDF: 1-3 секунды
    • Сканы (OCR): 1-3 минуты
@@ -182,8 +207,12 @@ def handle_file_questions(text):
     
     return None
 
-def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=None):
-    """Извлекает текст из PDF с улучшенной обработкой ошибок и прогрессом"""
+def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=None, first_page=None, last_page=None, max_pages_default=10):
+    """Извлекает текст из PDF с улучшенной обработкой ошибок и прогрессом.
+
+    Если требуется OCR, можно указать диапазон страниц через first_page/last_page.
+    По умолчанию обрабатываются первые max_pages_default страниц.
+    """
     if not is_ocr_needed:
         try:
             reader = PyPDF2.PdfReader(BytesIO(file_bytes))
@@ -196,18 +225,12 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
 
     logger.info("🖼️ Запуск OCR...")
     try:
-        # Ограничиваем количество страниц и уменьшаем DPI для экономии памяти
-        images = convert_from_bytes(
-            file_bytes, 
-            dpi=150,  # Уменьшили с 200 до 150
-            first_page=1, 
-            last_page=10  # Максимум 10 страниц
-        )
-        
-        if len(images) > 10:
-            logger.warning(f"⚠️ Файл содержит больше 10 страниц. Обрабатываю только первые 10.")
-            if progress_callback:
-                progress_callback("⚠️ Обрабатываю только первые 10 страниц из-за ограничений")
+        # Определяем диапазон страниц и уменьшаем DPI для экономии памяти
+        fp = first_page if first_page is not None else 1
+        lp = last_page if last_page is not None else max_pages_default
+        if lp < fp:
+            fp, lp = lp, fp
+        images = convert_from_bytes(file_bytes, dpi=150, first_page=fp, last_page=lp)
         
         ocr_text = ""
         for i, img in enumerate(images):
@@ -277,7 +300,95 @@ def telegram_webhook():
         data = request.get_json()
         logger.info(f"📨 Получен webhook: {data}")
         
-        if not data or "message" not in data:
+        if not data:
+            logger.info("❌ Пустой webhook")
+            return "OK", 200
+
+        # Callback-кнопки (inline)
+        if "callback_query" in data:
+            cb = data["callback_query"]
+            callback_id = cb.get("id")
+            from_user = cb.get("from", {})
+            chat = cb.get("message", {}).get("chat", {})
+            chat_id = chat.get("id")
+            action = cb.get("data")
+            logger.info(f"🖱️ Callback: {action} от {from_user.get('id')} в чате {chat_id}")
+
+            if callback_id:
+                answer_callback_query(callback_id)
+
+            pending = pending_files.get(chat_id)
+            if not pending:
+                send_message(chat_id, "❌ Не найден файл для обработки. Отправьте PDF заново.")
+                return "OK", 200
+
+            file_bytes = pending.get("file_bytes")
+            base_name = pending.get("file_name", "converted.pdf")
+            total_pages = pending.get("num_pages", 0)
+
+            def progress_callback(msg):
+                logger.info(f"📊 {msg}")
+
+            if action == "OCR_FIRST_10":
+                send_message(chat_id, "🔟 Начинаю распознавать первые 10 страниц...")
+                try:
+                    text = extract_text_from_pdf(
+                        file_bytes,
+                        is_ocr_needed=True,
+                        progress_callback=progress_callback,
+                        first_page=1,
+                        last_page=min(10, total_pages)
+                    )
+                    if not text.strip():
+                        send_message(chat_id, "❌ Не удалось извлечь текст с первых 10 страниц.")
+                    else:
+                        txt_name = os.path.splitext(base_name)[0] + "_p1-" + str(min(10, total_pages)) + ".txt"
+                        txt_buffer = BytesIO(text.encode("utf-8"))
+                        send_document(chat_id, txt_buffer, txt_name)
+                        send_message(chat_id, "✅ Готово! Отправил результат для первых 10 страниц.")
+                except Exception as e:
+                    logger.exception("💥 Ошибка при OCR первых 10 страниц")
+                    send_message(chat_id, "❌ Произошла ошибка при распознавании первых 10 страниц.")
+                finally:
+                    pending_files.pop(chat_id, None)
+                    set_user_waiting_for_file(chat_id, False)
+                return "OK", 200
+
+            if action == "SPLIT_PDF":
+                send_message(chat_id, f"✂️ Начинаю делить файл на части по 10 страниц (всего {total_pages}).")
+                part_index = 1
+                for start in range(1, total_pages + 1, 10):
+                    end = min(start + 9, total_pages)
+                    send_message(chat_id, f"⏳ Обрабатываю страницы {start}-{end}...")
+                    try:
+                        part_text = extract_text_from_pdf(
+                            file_bytes,
+                            is_ocr_needed=True,
+                            progress_callback=progress_callback,
+                            first_page=start,
+                            last_page=end
+                        )
+                        if not part_text.strip():
+                            send_message(chat_id, f"⚠️ Не удалось извлечь текст для страниц {start}-{end}.")
+                        else:
+                            txt_name = os.path.splitext(base_name)[0] + f"_part{part_index}_p{start}-{end}.txt"
+                            txt_buffer = BytesIO(part_text.encode("utf-8"))
+                            send_document(chat_id, txt_buffer, txt_name)
+                            send_message(chat_id, f"✅ Готово: страницы {start}-{end} отправлены.")
+                    except Exception as e:
+                        logger.exception(f"💥 Ошибка при обработке страниц {start}-{end}")
+                        send_message(chat_id, f"❌ Ошибка при обработке страниц {start}-{end}.")
+                    finally:
+                        part_index += 1
+                send_message(chat_id, "🎉 Все части готовы и отправлены. Можете отправить следующий файл.")
+                pending_files.pop(chat_id, None)
+                set_user_waiting_for_file(chat_id, False)
+                return "OK", 200
+
+            send_message(chat_id, "❓ Неизвестное действие. Попробуйте снова.")
+            return "OK", 200
+
+        if "message" not in data:
             logger.info("❌ Нет сообщения в данных")
             return "OK", 200
 
@@ -314,7 +425,7 @@ def telegram_webhook():
                 set_user_waiting_for_file(chat_id, True)
                 send_message(
                     chat_id,
-                    "📎 Отлично! Теперь отправьте PDF файл для конвертации.\n\n💡 **Совет:** Файл должен быть в формате PDF и не превышать 50 МБ."
+                    "📎 Отлично! Теперь отправьте PDF файл для конвертации.\n\n💡 Максимальный размер файла: 20 МБ"
                 )
             elif text == "Возможности и ограничения":
                 # Показать описание бота
@@ -361,7 +472,7 @@ def telegram_webhook():
             # Проверяем размер файла
             file_size = doc.get("file_size", 0)
             if file_size > 50 * 1024 * 1024:  # 50 МБ
-                send_message(chat_id, "❌ Файл слишком большой для обработки. Максимальный размер: 50 МБ")
+                send_message(chat_id, "❌ Файл слишком большой для обработки. Максимальный размер: 20 МБ")
                 return "OK", 200
             
             # Ограничение Telegram Bot API на скачивание файлов напрямую ~20 МБ
@@ -410,17 +521,44 @@ def telegram_webhook():
                     logger.warning(f"⚠️ Ошибка анализа PDF: {e}")
                     is_ocr_needed = True
 
-                if is_ocr_needed:
+                # Определим количество страниц (для OCR-сценариев)
+                num_pages = 0
+                try:
+                    reader = PyPDF2.PdfReader(BytesIO(file_bytes))
+                    num_pages = len(reader.pages)
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось определить количество страниц: {e}")
+
+                if is_ocr_needed and num_pages > 10:
+                    # Сохраняем файл и предлагаем варианты
+                    pending_files[chat_id] = {
+                        "file_bytes": file_bytes,
+                        "file_name": doc.get("file_name", "converted.pdf"),
+                        "num_pages": num_pages,
+                        "created_at": time.time()
+                    }
                     send_message(
                         chat_id,
-                        "🔍 Обнаружен скан. Использую OCR. Это займёт 1-3 минуты..."
+                        f"🔍 Обнаружен сканированный PDF на {num_pages} страниц.\n\nВыберите, как поступить:",
+                        reply_markup=build_split_options_keyboard()
                     )
+                    return "OK", 200
+                else:
+                    if is_ocr_needed:
+                        send_message(
+                            chat_id,
+                            "🔍 Обнаружен скан. Использую OCR. Это займёт 1-3 минуты..."
+                        )
 
                 # Функция для отправки прогресса
                 def progress_callback(message):
                     logger.info(f"📊 {message}")
 
-                text = extract_text_from_pdf(file_bytes, is_ocr_needed=is_ocr_needed, progress_callback=progress_callback)
+                text = extract_text_from_pdf(
+                    file_bytes,
+                    is_ocr_needed=is_ocr_needed,
+                    progress_callback=progress_callback
+                )
                 if not text.strip():
                     send_message(chat_id, "❌ Не удалось извлечь текст.")
                     return "OK", 200
