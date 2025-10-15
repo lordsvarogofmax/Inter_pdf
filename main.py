@@ -663,9 +663,12 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
                 # Конвертируем только текущую часть
                 chunk_images = convert_from_bytes(file_bytes, dpi=200, first_page=start_page, last_page=end_page)
                 
-                # Обрабатываем часть
-                chunk_text = process_image_chunk(chunk_images, progress_callback)
-                ocr_text += chunk_text + "\n"
+                if chunk_images:  # Проверяем, что получили изображения
+                    # Обрабатываем часть
+                    chunk_text = process_image_chunk(chunk_images, progress_callback)
+                    ocr_text += chunk_text + "\n"
+                else:
+                    logger.warning(f"⚠️ Не удалось конвертировать страницы {start_page}-{end_page}")
                 
                 # Освобождаем память
                 del chunk_images
@@ -674,13 +677,21 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
         else:
             # Обычная обработка для небольших файлов
             images = convert_from_bytes(file_bytes, dpi=200, first_page=fp, last_page=lp)
-            return process_image_chunk(images, progress_callback)
+            if images:
+                return process_image_chunk(images, progress_callback)
+            else:
+                logger.error("❌ Не удалось конвертировать PDF в изображения")
+                return ""
     except Exception as e:
         logger.exception("💥 OCR провален")
         raise
 
 def process_image_chunk(images, progress_callback=None):
     """Обрабатывает часть изображений для OCR"""
+    if not images:
+        logger.warning("⚠️ Нет изображений для обработки")
+        return ""
+    
     ocr_text = ""
     # Параллельное распознавание страниц для ускорения
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -764,7 +775,7 @@ def process_image_chunk(images, progress_callback=None):
         return i, text
 
     # Уменьшаем количество потоков для Render (ограниченная память)
-    max_workers = min(3, len(images))
+    max_workers = max(1, min(3, len(images)))  # Минимум 1 поток
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(ocr_single, (i, img)): i for i, img in enumerate(images)}
         
