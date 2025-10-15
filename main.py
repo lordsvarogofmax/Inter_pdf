@@ -533,17 +533,17 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
                 if img.width > 2000 or img.height > 2000:
                     img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
                 proc_img = preprocess_image_for_ocr(img)
-                    safe_whitelist = (
-                        "0123456789"
-                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                        "abcdefghijklmnopqrstuvwxyz"
-                        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-                        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+                safe_whitelist = (
+                    "0123456789"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+                    "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
                     ".,:;!?()\-–—_"
-                    )
-                    text = pytesseract.image_to_string(
+                )
+                text = pytesseract.image_to_string(
                     proc_img,
-                        lang='rus+eng',
+                    lang='rus+eng',
                     config=f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
                 )
             except Exception as e:
