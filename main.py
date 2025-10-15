@@ -46,6 +46,8 @@ user_states = {}
 pending_files = {}
 # Ожидание текстового комментария по conversion_id
 awaiting_comment = {}
+# Дедупликация callback-запросов, чтобы не перезапускать обработку
+processed_callback_ids = set()
 
 # --- БД и аналитика ---
 def get_db():
@@ -531,17 +533,17 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
                 if img.width > 2000 or img.height > 2000:
                     img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
                 proc_img = preprocess_image_for_ocr(img)
-                safe_whitelist = (
-                    "0123456789"
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    "abcdefghijklmnopqrstuvwxyz"
-                    "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-                    "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+                    safe_whitelist = (
+                        "0123456789"
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        "abcdefghijklmnopqrstuvwxyz"
+                        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+                        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
                     ".,:;!?()\-–—_"
-                )
-                text = pytesseract.image_to_string(
+                    )
+                    text = pytesseract.image_to_string(
                     proc_img,
-                    lang='rus+eng',
+                        lang='rus+eng',
                     config=f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
                 )
             except Exception as e:
@@ -586,8 +588,14 @@ def telegram_webhook():
             action = cb.get("data")
             logger.info(f"🖱️ Callback: {action} от {from_user.get('id')} в чате {chat_id}")
 
+            # Дедуп: игнорируем повторные callback'и с тем же ID
+            if callback_id in processed_callback_ids:
+                logger.info(f"🔁 Пропуск повторного callback_id={callback_id}")
+                return "OK", 200
+
             if callback_id:
                 answer_callback_query(callback_id)
+                processed_callback_ids.add(callback_id)
 
             # Обработка оценки качества с conversion_id
             if action and action.startswith("RATE_"):
@@ -658,7 +666,7 @@ def telegram_webhook():
                     logger.exception("💥 Ошибка при OCR первых 10 страниц")
                     send_message(chat_id, "❌ Произошла ошибка при распознавании первых 10 страниц.")
                 finally:
-                    pending_files.pop(chat_id, None)
+                    # Не очищаем pending_files здесь, т.к. он нужен для SPLIT_PDF цикла
                     set_user_waiting_for_file(chat_id, False)
                 return "OK", 200
 
@@ -689,6 +697,7 @@ def telegram_webhook():
                     finally:
                         part_index += 1
                 send_message(chat_id, "🎉 Все части готовы и отправлены. Можете отправить следующий файл.")
+                # Очищаем pending после полного завершения цикла
                 pending_files.pop(chat_id, None)
                 set_user_waiting_for_file(chat_id, False)
                 return "OK", 200
@@ -923,8 +932,8 @@ def telegram_webhook():
                     if is_ocr_needed:
                         send_message(
                             chat_id,
-                            "🔍 Обнаружен скан. Использую OCR. Это займёт несколько минут..."
-                        )
+                            "🔍 Обнаружен скан. Использую OCR. Это займёт 1-3 минуты..."
+                    )
 
                 # Функция для отправки прогресса
                 def progress_callback(message):
