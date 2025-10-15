@@ -402,13 +402,51 @@ def build_split_options_keyboard():
     }
 
 def clean_text(text):
-    """Очищает извлеченный текст"""
+    """Очищает извлеченный текст с улучшенной постобработкой"""
     if not text:
         return ""
+    
+    # Исправляем переносы слов
     text = re.sub(r'([а-яА-Яa-zA-Z])-\n([а-яА-Яa-zA-Z])', r'\1\2', text)
+    
+    # Заменяем одиночные переносы на пробелы
     text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+    
+    # Убираем лишние пробелы
     text = re.sub(r' +', ' ', text)
+    
+    # Исправляем слипшиеся слова (добавляем пробелы между заглавными буквами)
+    text = re.sub(r'([а-я])([А-Я])', r'\1 \2', text)
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    
+    # Исправляем слипшиеся цифры и буквы
+    text = re.sub(r'([а-яА-Яa-zA-Z])(\d)', r'\1 \2', text)
+    text = re.sub(r'(\d)([а-яА-Яa-zA-Z])', r'\1 \2', text)
+    
+    # Исправляем слипшиеся знаки препинания
+    text = re.sub(r'([а-яА-Яa-zA-Z])([.,:;!?])', r'\1\2', text)
+    text = re.sub(r'([.,:;!?])([а-яА-Яa-zA-Z])', r'\1 \2', text)
+    
+    # Исправляем типичные OCR ошибки
+    ocr_fixes = {
+        '0': 'О',  # Цифра 0 вместо буквы О в начале слов
+        '1': 'I',  # Цифра 1 вместо буквы I
+        '5': 'S',  # Цифра 5 вместо буквы S
+        '8': 'B',  # Цифра 8 вместо буквы B
+    }
+    
+    # Применяем исправления только в контексте слов
+    for wrong, correct in ocr_fixes.items():
+        # Заменяем цифры на буквы в словах (но не в числах)
+        text = re.sub(rf'\b{wrong}([а-яА-Яa-zA-Z])', rf'{correct}\1', text)
+        text = re.sub(rf'([а-яА-Яa-zA-Z]){wrong}\b', rf'\1{correct}', text)
+    
+    # Убираем лишние пробелы после исправлений
+    text = re.sub(r' +', ' ', text)
+    
+    # Форматируем строки
     text = '\n'.join(line.strip() for line in text.splitlines())
+    
     return text.strip()
 
 def pil_to_cv(img_pil):
@@ -448,44 +486,113 @@ def deskew_image(gray):
         return gray
 
 def preprocess_image_for_ocr(img_pil):
-    """Apply enhanced denoise, binarization, morphology, and deskew to improve OCR."""
+    """Агрессивная предобработка для плохих сканов с множественными методами."""
     img_cv = pil_to_cv(img_pil)
     if img_cv.ndim == 3:
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     else:
         gray = img_cv
     
-    # Увеличиваем контраст для лучшего распознавания
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    # Масштабирование в первую очередь для лучшего качества
+    scale_factor = 3.0  # Увеличиваем масштаб для лучшего распознавания
+    if gray.shape[0] < 2000 or gray.shape[1] < 2000:
+        new_width = int(gray.shape[1] * scale_factor)
+        new_height = int(gray.shape[0] * scale_factor)
+        gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+    
+    # Агрессивное улучшение контраста
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
     gray = clahe.apply(gray)
     
+    # Дополнительное выравнивание гистограммы
+    gray = cv2.equalizeHist(gray)
+    
     # Улучшенное шумоподавление
-    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-    gray = cv2.medianBlur(gray, 3)
+    gray = cv2.bilateralFilter(gray, d=11, sigmaColor=100, sigmaSpace=100)
+    gray = cv2.medianBlur(gray, 5)
     
-    # Адаптивная пороговая обработка с улучшенными параметрами
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 21, 10)
+    # Множественные методы бинаризации и выбор лучшего
+    methods = []
     
-    # Морфологические операции для очистки
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Метод 1: Адаптивная пороговая обработка
+    thr1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 25, 15)
+    methods.append(thr1)
     
-    # Дополнительная очистка от мелких объектов
-    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
-    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
+    # Метод 2: Otsu thresholding
+    _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    methods.append(thr2)
+    
+    # Метод 3: Адаптивная с другим ядром
+    thr3 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY, 21, 12)
+    methods.append(thr3)
+    
+    # Выбираем метод с лучшим соотношением белого/черного
+    best_thr = None
+    best_ratio = 0
+    for thr in methods:
+        white_pixels = np.sum(thr == 255)
+        total_pixels = thr.shape[0] * thr.shape[1]
+        ratio = white_pixels / total_pixels
+        if 0.1 < ratio < 0.9:  # Ищем сбалансированное изображение
+            if abs(ratio - 0.5) < abs(best_ratio - 0.5):
+                best_ratio = ratio
+                best_thr = thr
+    
+    if best_thr is None:
+        best_thr = methods[0]  # Fallback на первый метод
+    
+    # Агрессивная морфологическая очистка
+    # Удаляем мелкий шум
+    kernel_noise = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    cleaned = cv2.morphologyEx(best_thr, cv2.MORPH_OPEN, kernel_noise, iterations=2)
+    
+    # Закрываем разрывы в символах
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    
+    # Удаляем очень мелкие объекты (шум)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(255 - cleaned, connectivity=8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] < 50:  # Удаляем объекты меньше 50 пикселей
+            cleaned[labels == i] = 255
     
     # Исправление наклона
-    thr = deskew_image(thr)
+    cleaned = deskew_image(cleaned)
     
-    # Масштабирование для улучшения качества OCR
-    scale_factor = 1.5
-    if thr.shape[0] < 1200 or thr.shape[1] < 1200:
-        new_width = int(thr.shape[1] * scale_factor)
-        new_height = int(thr.shape[0] * scale_factor)
-        thr = cv2.resize(thr, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-    
-    return cv_to_pil(thr)
+    return cv_to_pil(cleaned)
+
+def enhance_ocr_with_alternatives(img_pil):
+    """Дополнительные методы улучшения OCR для сложных случаев"""
+    try:
+        # Создаем несколько вариантов изображения для OCR
+        variants = []
+        
+        # Вариант 1: Оригинальная предобработка
+        variants.append(("original", preprocess_image_for_ocr(img_pil)))
+        
+        # Вариант 2: Инвертированные цвета (для белого текста на темном фоне)
+        img_cv = pil_to_cv(img_pil)
+        if img_cv.ndim == 3:
+            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_cv
+        inverted = 255 - gray
+        variants.append(("inverted", cv_to_pil(inverted)))
+        
+        # Вариант 3: Высокий контраст
+        high_contrast = cv2.convertScaleAbs(gray, alpha=2.0, beta=0)
+        variants.append(("high_contrast", cv_to_pil(high_contrast)))
+        
+        # Вариант 4: Размытие для сглаживания
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        variants.append(("blurred", cv_to_pil(blurred)))
+        
+        return variants
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка создания вариантов изображения: {e}")
+        return [("original", img_pil)]
 
 def handle_file_questions(text):
     """Обрабатывает вопросы о файлах и ограничениях"""
@@ -555,37 +662,73 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
                 # Оптимизируем размер изображения для баланса качества и скорости
                 if img.width > 2500 or img.height > 2500:
                     img.thumbnail((2500, 2500), Image.Resampling.LANCZOS)
-                proc_img = preprocess_image_for_ocr(img)
-                # Улучшенные настройки для русского текста
+                
+                # Расширенный whitelist для лучшего распознавания
                 safe_whitelist = (
                     "0123456789"
                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                     "abcdefghijklmnopqrstuvwxyz"
                     "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
                     "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-                    ".,:;!?()\-–—_№%$€₽"
+                    ".,:;!?()\-–—_№%$€₽«»""''"
                 )
                 
-                # Пробуем разные режимы сегментации для лучшего качества
+                # Множественные конфигурации для разных типов документов
                 configs = [
-                    f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
-                    f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
-                    f"--psm 3 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
+                    # Для обычного текста
+                    f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                    # Для блочного текста
+                    f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                    # Для одной колонки
+                    f"--psm 3 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                    # Для таблиц и форм
+                    f"--psm 8 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
+                    # Без whitelist для сложных случаев
+                    "--psm 6 --oem 3 -c preserve_interword_spaces=1",
+                    "--psm 4 --oem 3 -c preserve_interword_spaces=1"
                 ]
                 
+                # Получаем варианты изображения для OCR
+                img_variants = enhance_ocr_with_alternatives(img)
+                
                 text = ""
-                for config in configs:
-                    try:
-                        text = pytesseract.image_to_string(
-                            proc_img,
-                            lang='rus+eng',
-                            config=config
-                        )
-                        if text.strip():  # Если получили текст, используем его
-                            break
-                    except Exception as e:
-                        logger.warning(f"⚠️ Ошибка OCR с конфигом {config}: {e}")
-                        continue
+                best_text = ""
+                max_length = 0
+                
+                # Пробуем все комбинации вариантов изображения и конфигураций
+                for variant_name, variant_img in img_variants:
+                    for config in configs:
+                        try:
+                            result = pytesseract.image_to_string(
+                                variant_img,
+                                lang='rus+eng',
+                                config=config
+                            )
+                            
+                            if result.strip():
+                                # Выбираем результат с наибольшим количеством символов
+                                if len(result.strip()) > max_length:
+                                    max_length = len(result.strip())
+                                    best_text = result
+                                
+                                # Если результат достаточно хорош, используем его
+                                if len(result.strip()) > 100:  # Минимум 100 символов
+                                    text = result
+                                    logger.info(f"✅ Найден хороший результат с {variant_name} и конфигом {config[:20]}...")
+                                    break
+                                    
+                        except Exception as e:
+                            logger.warning(f"⚠️ Ошибка OCR с {variant_name} и конфигом {config[:20]}: {e}")
+                            continue
+                    
+                    if text.strip():  # Если нашли хороший результат, прерываем
+                        break
+                
+                # Если не нашли хороший результат, используем лучший из всех
+                if not text.strip() and best_text.strip():
+                    text = best_text
+                    logger.info(f"✅ Используем лучший результат из всех попыток ({max_length} символов)")
+                
             except Exception as e:
                 logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
                 text = ""
