@@ -448,22 +448,43 @@ def deskew_image(gray):
         return gray
 
 def preprocess_image_for_ocr(img_pil):
-    """Apply denoise, binarization, morphology, and deskew to improve OCR."""
+    """Apply enhanced denoise, binarization, morphology, and deskew to improve OCR."""
     img_cv = pil_to_cv(img_pil)
     if img_cv.ndim == 3:
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     else:
         gray = img_cv
-    # Light denoise
-    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
-    # Adaptive threshold for uneven backgrounds
+    
+    # Увеличиваем контраст для лучшего распознавания
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray)
+    
+    # Улучшенное шумоподавление
+    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    gray = cv2.medianBlur(gray, 3)
+    
+    # Адаптивная пороговая обработка с улучшенными параметрами
     thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 31, 15)
-    # Morph open to remove small noise
+                                cv2.THRESH_BINARY, 21, 10)
+    
+    # Морфологические операции для очистки
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    # Deskew
+    
+    # Дополнительная очистка от мелких объектов
+    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
+    
+    # Исправление наклона
     thr = deskew_image(thr)
+    
+    # Масштабирование для улучшения качества OCR
+    scale_factor = 1.5
+    if thr.shape[0] < 1200 or thr.shape[1] < 1200:
+        new_width = int(thr.shape[1] * scale_factor)
+        new_height = int(thr.shape[0] * scale_factor)
+        thr = cv2.resize(thr, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+    
     return cv_to_pil(thr)
 
 def handle_file_questions(text):
@@ -521,7 +542,8 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
         lp = last_page if last_page is not None else max_pages_default
         if lp < fp:
             fp, lp = lp, fp
-        images = convert_from_bytes(file_bytes, dpi=200, first_page=fp, last_page=lp)
+        # Увеличиваем DPI для лучшего качества, но ограничиваем размер
+        images = convert_from_bytes(file_bytes, dpi=250, first_page=fp, last_page=lp)
         
         ocr_text = ""
         # Параллельное распознавание страниц для ускорения
@@ -530,28 +552,46 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
         def ocr_single(idx_img):
             i, img = idx_img
             try:
-                if img.width > 2000 or img.height > 2000:
-                    img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                # Оптимизируем размер изображения для баланса качества и скорости
+                if img.width > 2500 or img.height > 2500:
+                    img.thumbnail((2500, 2500), Image.Resampling.LANCZOS)
                 proc_img = preprocess_image_for_ocr(img)
+                # Улучшенные настройки для русского текста
                 safe_whitelist = (
                     "0123456789"
                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                     "abcdefghijklmnopqrstuvwxyz"
                     "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
                     "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-                    ".,:;!?()\-–—_"
+                    ".,:;!?()\-–—_№%$€₽"
                 )
-                text = pytesseract.image_to_string(
-                    proc_img,
-                    lang='rus+eng',
-                    config=f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
-                )
+                
+                # Пробуем разные режимы сегментации для лучшего качества
+                configs = [
+                    f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
+                    f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
+                    f"--psm 3 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
+                ]
+                
+                text = ""
+                for config in configs:
+                    try:
+                        text = pytesseract.image_to_string(
+                            proc_img,
+                            lang='rus+eng',
+                            config=config
+                        )
+                        if text.strip():  # Если получили текст, используем его
+                            break
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка OCR с конфигом {config}: {e}")
+                        continue
             except Exception as e:
                 logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
                 text = ""
             return i, text
 
-        with ThreadPoolExecutor(max_workers=min(4, len(images))) as executor:
+        with ThreadPoolExecutor(max_workers=min(8, len(images))) as executor:
             futures = {executor.submit(ocr_single, (i, img)): i for i, img in enumerate(images)}
             for fut in as_completed(futures):
                 i, text = fut.result()
