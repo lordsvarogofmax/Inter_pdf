@@ -15,6 +15,8 @@ import sqlite3
 import json
 from datetime import datetime, timedelta
 import openpyxl
+import numpy as np
+import cv2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +44,8 @@ user_states = {}
 
 # Временное хранилище для больших OCR-PDF, ожидающих выбора пользователя
 pending_files = {}
+# Ожидание текстового комментария по conversion_id
+awaiting_comment = {}
 
 # --- БД и аналитика ---
 def get_db():
@@ -80,8 +84,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS feedback (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
-                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-                created_at TEXT NOT NULL
+                conversion_id TEXT NOT NULL,
+                rating INTEGER CHECK (rating BETWEEN 1 AND 5),
+                comment TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, conversion_id)
             )
             """
         )
@@ -116,27 +123,51 @@ def log_error(user_id, error_code, message):
     except Exception as e:
         logger.exception("💥 Ошибка записи ошибки в БД")
 
-def save_feedback(user_id, rating):
+def save_feedback(user_id, conversion_id, rating=None, comment=None):
     try:
         conn = get_db()
         cur = conn.cursor()
+        # upsert по паре (user_id, conversion_id)
         cur.execute(
-            "INSERT INTO feedback (user_id, rating, created_at) VALUES (?, ?, ?)",
-            (str(user_id), int(rating), datetime.utcnow().isoformat())
+            """
+            INSERT INTO feedback (user_id, conversion_id, rating, comment, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, conversion_id) DO UPDATE SET
+                rating=COALESCE(excluded.rating, feedback.rating),
+                comment=COALESCE(excluded.comment, feedback.comment)
+            """,
+            (str(user_id), str(conversion_id), int(rating) if rating is not None else None, comment, datetime.utcnow().isoformat())
         )
         conn.commit()
         conn.close()
     except Exception as e:
         logger.exception("💥 Ошибка записи оценки в БД")
 
-def build_rating_keyboard():
+def get_feedback(user_id, conversion_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, conversion_id, rating, comment, created_at FROM feedback WHERE user_id=? AND conversion_id=?",
+            (str(user_id), str(conversion_id))
+        )
+        row = cur.fetchone()
+        conn.close()
+        return row
+    except Exception as e:
+        logger.exception("💥 Ошибка чтения feedback из БД")
+        return None
+
+def build_rating_keyboard(conversion_id):
     return {
         "inline_keyboard": [[
-            {"text": "⭐", "callback_data": "RATE_1"},
-            {"text": "⭐⭐", "callback_data": "RATE_2"},
-            {"text": "⭐⭐⭐", "callback_data": "RATE_3"},
-            {"text": "⭐⭐⭐⭐", "callback_data": "RATE_4"},
-            {"text": "⭐⭐⭐⭐⭐", "callback_data": "RATE_5"},
+            {"text": "⭐", "callback_data": f"RATE_1|{conversion_id}"},
+            {"text": "⭐⭐", "callback_data": f"RATE_2|{conversion_id}"},
+            {"text": "⭐⭐⭐", "callback_data": f"RATE_3|{conversion_id}"},
+            {"text": "⭐⭐⭐⭐", "callback_data": f"RATE_4|{conversion_id}"},
+            {"text": "⭐⭐⭐⭐⭐", "callback_data": f"RATE_5|{conversion_id}"},
+        ], [
+            {"text": "🗒️ Оставить комментарий", "callback_data": f"FB_COMMENT|{conversion_id}"}
         ]]
     }
 
@@ -278,7 +309,7 @@ def generate_excel_stats(last_days=30):
     ocr_errors = cur.fetchone()[0] or 0
     cur.execute("SELECT COUNT(*) FROM errors WHERE created_at >= ?", (cutoff,))
     total_errors = cur.fetchone()[0] or 0
-    cur.execute("SELECT rating, COUNT(*) FROM feedback WHERE created_at >= ? GROUP BY rating ORDER BY rating", (cutoff,))
+    cur.execute("SELECT rating, COUNT(*) FROM feedback WHERE rating IS NOT NULL AND created_at >= ? GROUP BY rating ORDER BY rating", (cutoff,))
     ratings_rows = cur.fetchall()
     # Daily events
     cur.execute(
@@ -304,8 +335,8 @@ def generate_excel_stats(last_days=30):
     errors_agg = cur.fetchall()
     cur.execute("SELECT created_at, user_id, error_code, message FROM errors WHERE created_at >= ? ORDER BY created_at DESC LIMIT 1000", (cutoff,))
     errors_raw = cur.fetchall()
-    # Feedback raw
-    cur.execute("SELECT created_at, user_id, rating FROM feedback WHERE created_at >= ? ORDER BY created_at DESC", (cutoff,))
+    # Feedback raw (включая комментарии и conversion_id)
+    cur.execute("SELECT created_at, user_id, conversion_id, rating, comment FROM feedback WHERE created_at >= ? ORDER BY created_at DESC", (cutoff,))
     feedback_raw = cur.fetchall()
     conn.close()
 
@@ -336,7 +367,7 @@ def generate_excel_stats(last_days=30):
         ws_errors_raw.append(list(row))
 
     ws_feedback = wb.create_sheet("Feedback")
-    ws_feedback.append(["CreatedAt", "UserId", "Rating"])
+    ws_feedback.append(["CreatedAt", "UserId", "ConversionId", "Rating", "Comment"])
     for row in feedback_raw:
         ws_feedback.append(list(row))
 
@@ -376,6 +407,61 @@ def clean_text(text):
     text = re.sub(r' +', ' ', text)
     text = '\n'.join(line.strip() for line in text.splitlines())
     return text.strip()
+
+def pil_to_cv(img_pil):
+    arr = np.array(img_pil)
+    if arr.ndim == 2:
+        return arr
+    # PIL is RGB, cv2 expects BGR
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+def cv_to_pil(img_cv):
+    if len(img_cv.shape) == 2:
+        rgb = cv2.cvtColor(img_cv, cv2.COLOR_GRAY2RGB)
+    else:
+        rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
+
+def deskew_image(gray):
+    # Estimate skew angle and rotate to deskew
+    try:
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        inv = 255 - thresh
+        coords = np.column_stack(np.where(inv > 0))
+        angle = 0.0
+        if coords.size > 0:
+            rect = cv2.minAreaRect(coords)
+            angle = rect[-1]
+            if angle < -45:
+                angle = -(90 + angle)
+            else:
+                angle = -angle
+        (h, w) = gray.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return rotated
+    except Exception:
+        return gray
+
+def preprocess_image_for_ocr(img_pil):
+    """Apply denoise, binarization, morphology, and deskew to improve OCR."""
+    img_cv = pil_to_cv(img_pil)
+    if img_cv.ndim == 3:
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img_cv
+    # Light denoise
+    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
+    # Adaptive threshold for uneven backgrounds
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 31, 15)
+    # Morph open to remove small noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Deskew
+    thr = deskew_image(thr)
+    return cv_to_pil(thr)
 
 def handle_file_questions(text):
     """Обрабатывает вопросы о файлах и ограничениях"""
@@ -432,62 +518,45 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
         lp = last_page if last_page is not None else max_pages_default
         if lp < fp:
             fp, lp = lp, fp
-        images = convert_from_bytes(file_bytes, dpi=150, first_page=fp, last_page=lp)
+        images = convert_from_bytes(file_bytes, dpi=200, first_page=fp, last_page=lp)
         
         ocr_text = ""
-        for i, img in enumerate(images):
-            if progress_callback:
-                progress_callback(f"🔍 Обрабатываю страницу {i+1}/{len(images)}")
-            else:
-                logger.info(f"🔍 Обрабатываю страницу {i+1}/{len(images)}")
-            
+        # Параллельное распознавание страниц для ускорения
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def ocr_single(idx_img):
+            i, img = idx_img
             try:
-                # Уменьшаем размер изображения для экономии памяти
                 if img.width > 2000 or img.height > 2000:
                     img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
-                    logger.info(f"📏 Уменьшил изображение до {img.size}")
-                
-                # Улучшенные параметры OCR с fallback
-                try:
-                    # Сначала пробуем с безопасным whitelist (без пробелов и кавычек)
-                    safe_whitelist = (
-                        "0123456789"
-                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                        "abcdefghijklmnopqrstuvwxyz"
-                        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-                        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-                        ".,:;!?()-_"
-                    )
-                    text = pytesseract.image_to_string(
-                        img,
-                        lang='rus+eng',
-                        config=f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
-                    )
-                except Exception as whitelist_error:
-                    logger.warning(f"⚠️ Ошибка с whitelist, пробую без него: {whitelist_error}")
-                    # Fallback без whitelist
-                    text = pytesseract.image_to_string(
-                        img, 
-                        lang='rus+eng',
-                        config='--psm 6 --oem 3'
-                    )
-                
-                ocr_text += text + "\n"
-                
+                proc_img = preprocess_image_for_ocr(img)
+                safe_whitelist = (
+                    "0123456789"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+                    "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+                    ".,:;!?()\-–—_"
+                )
+                text = pytesseract.image_to_string(
+                    proc_img,
+                    lang='rus+eng',
+                    config=f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
+                )
+            except Exception as e:
+                logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
+                text = ""
+            return i, text
+
+        with ThreadPoolExecutor(max_workers=min(4, len(images))) as executor:
+            futures = {executor.submit(ocr_single, (i, img)): i for i, img in enumerate(images)}
+            for fut in as_completed(futures):
+                i, text = fut.result()
                 if progress_callback:
                     progress_callback(f"✅ Страница {i+1} завершена")
                 else:
                     logger.info(f"✅ Страница {i+1} завершена")
-                
-                # Небольшая пауза между страницами для стабильности
-                time.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
-                if progress_callback:
-                    progress_callback(f"❌ Ошибка на странице {i+1}, пропускаю")
-                continue
-                
+                ocr_text += text + "\n"
         logger.info("✅ OCR завершен успешно")
         return clean_text(ocr_text)
         
@@ -519,19 +588,40 @@ def telegram_webhook():
             if callback_id:
                 answer_callback_query(callback_id)
 
-            # Обработка оценки качества
+            # Обработка оценки качества с conversion_id
             if action and action.startswith("RATE_"):
                 try:
-                    rating = int(action.split("_")[1])
+                    payload = action.split("_")[1]
+                    rating_str, conv_id = payload.split("|")
+                    rating = int(rating_str)
+                    # Проверяем, не оставлял ли уже пользователь feedback для этой конвертации
+                    if get_feedback(chat_id, conv_id):
+                        send_message(chat_id, "ℹ️ Оценка/комментарий по этой конвертации уже сохранены.")
+                        return "OK", 200
                     if 1 <= rating <= 5:
-                        save_feedback(chat_id, rating)
-                        log_event(chat_id, "feedback", {"rating": rating})
+                        save_feedback(chat_id, conv_id, rating=rating)
+                        log_event(chat_id, "feedback", {"rating": rating, "conversion_id": conv_id})
                         send_message(chat_id, "🙏 Спасибо! Ваша оценка помогает нам становиться лучше.")
                     else:
                         send_message(chat_id, "❌ Некорректная оценка.")
                 except Exception as e:
                     logger.exception("💥 Ошибка обработки рейтинга")
                     send_message(chat_id, "❌ Не удалось сохранить оценку.")
+                return "OK", 200
+
+            # Запрос комментария по conversion_id
+            if action and action.startswith("FB_COMMENT|"):
+                try:
+                    conv_id = action.split("|")[1]
+                    # Если уже есть запись feedback для этой пары, не даём повторно
+                    if get_feedback(chat_id, conv_id):
+                        send_message(chat_id, "ℹ️ Комментарий по этой конвертации уже сохранён.")
+                        return "OK", 200
+                    awaiting_comment[chat_id] = conv_id
+                    send_message(chat_id, "✍️ Напишите, пожалуйста, комментарий: что понравилось/не понравилось/что улучшить.")
+                except Exception as e:
+                    logger.exception("💥 Ошибка запуска запроса комментария")
+                    send_message(chat_id, "❌ Не удалось запросить комментарий.")
                 return "OK", 200
 
             pending = pending_files.get(chat_id)
@@ -625,6 +715,18 @@ def telegram_webhook():
 
         if "text" in message:
             text = message["text"]
+            # Приоритетно: если ожидаем комментарий, сохраняем его
+            if chat_id in awaiting_comment:
+                conv_id = awaiting_comment.pop(chat_id)
+                try:
+                    # Сохраняем комментарий единожды для этой конвертации
+                    save_feedback(chat_id, conv_id, comment=text)
+                    log_event(chat_id, "feedback_comment", {"conversion_id": conv_id})
+                    send_message(chat_id, "✅ Спасибо! Комментарий сохранён.")
+                except Exception as e:
+                    logger.exception("💥 Ошибка сохранения комментария")
+                    send_message(chat_id, "❌ Не удалось сохранить комментарий.")
+                return "OK", 200
             if text == "/start":
                 # Сбрасываем состояние пользователя
                 set_user_waiting_for_file(chat_id, False)
@@ -842,11 +944,13 @@ def telegram_webhook():
                 txt_name = os.path.splitext(base_name)[0] + ".txt"
                 txt_buffer = BytesIO(text.encode("utf-8"))
                 send_document(chat_id, txt_buffer, txt_name)
-                log_event(chat_id, "ocr_success", {"file_name": base_name})
+                # Генерируем conversion_id: message_id + timestamp
+                conversion_id = f"{message_id}_{int(time.time())}"
+                log_event(chat_id, "ocr_success", {"file_name": base_name, "conversion_id": conversion_id})
                 send_message(
                     chat_id,
                     "📝 Оцените качество распознавания (1 — плохо, 5 — отлично):",
-                    reply_markup=build_rating_keyboard()
+                    reply_markup=build_rating_keyboard(conversion_id)
                 )
 
                 # Сбрасываем состояние ожидания файла
