@@ -189,11 +189,19 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
                 
                 # Улучшенные параметры OCR с fallback
                 try:
-                    # Сначала пробуем с whitelist
+                    # Сначала пробуем с безопасным whitelist (без пробелов и кавычек)
+                    safe_whitelist = (
+                        "0123456789"
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        "abcdefghijklmnopqrstuvwxyz"
+                        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+                        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+                        ".,:;!?()-_"
+                    )
                     text = pytesseract.image_to_string(
-                        img, 
+                        img,
                         lang='rus+eng',
-                        config='--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя.,!?;:()[]{}\"\'`~@#$%^&*+=|\\/<>-_ '
+                        config=f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist}"
                     )
                 except Exception as whitelist_error:
                     logger.warning(f"⚠️ Ошибка с whitelist, пробую без него: {whitelist_error}")
@@ -322,6 +330,15 @@ def telegram_webhook():
                 send_message(chat_id, "❌ Файл слишком большой для обработки. Максимальный размер: 50 МБ")
                 return "OK", 200
             
+            # Ограничение Telegram Bot API на скачивание файлов напрямую ~20 МБ
+            if file_size > 20 * 1024 * 1024:
+                send_message(
+                    chat_id,
+                    "❌ Этот PDF больше 20 МБ. Боты Telegram не могут скачивать такие файлы.\n"
+                    "📦 Пожалуйста, сожмите PDF, разбейте на части или пришлите ссылку на файл."
+                )
+                return "OK", 200
+
             if file_size > 10 * 1024 * 1024:  # 10 МБ
                 send_message(chat_id, "⚠️ Большой файл. Обработка может занять несколько минут...")
 
@@ -333,7 +350,7 @@ def telegram_webhook():
                 
                 resp = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}", timeout=10)
                 if not resp.ok:
-                    logger.error(f"❌ Ошибка получения файла: {resp.status_code}")
+                    logger.error(f"❌ Ошибка получения файла: {resp.status_code} - {resp.text}")
                     send_message(chat_id, "❌ Ошибка загрузки файла.")
                     return "OK", 200
                 
