@@ -13,7 +13,8 @@ import pytesseract
 from PIL import Image
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import openpyxl
 
 logging.basicConfig(
     level=logging.INFO,
@@ -244,6 +245,105 @@ def send_document(chat_id, file_buffer, filename):
         logger.error("⏰ Таймаут при отправке документа")
     except Exception as e:
         logger.exception("💥 Ошибка при отправке документа")
+
+def send_binary_document(chat_id, file_buffer, filename, mime_type):
+    """Отправляет бинарный документ (например, .xlsx)."""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        files = {"document": (filename, file_buffer, mime_type)}
+        data = {"chat_id": chat_id}
+        response = requests.post(url, files=files, data=data, timeout=60)
+        if not response.ok:
+            logger.error(f"❌ Ошибка отправки бинарного документа: {response.status_code} - {response.text}")
+        else:
+            logger.info(f"✅ Документ {filename} отправлен в чат {chat_id}")
+    except requests.exceptions.Timeout:
+        logger.error("⏰ Таймаут при отправке бинарного документа")
+    except Exception as e:
+        logger.exception("💥 Ошибка при отправке бинарного документа")
+
+def generate_excel_stats(last_days=30):
+    """Генерирует Excel со статистикой за последние N дней."""
+    cutoff = (datetime.utcnow() - timedelta(days=last_days)).isoformat()
+    conn = get_db()
+    cur = conn.cursor()
+    # Overview
+    cur.execute("SELECT COUNT(DISTINCT user_id) FROM events WHERE created_at >= ?", (cutoff,))
+    unique_users = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM events WHERE event='file_received' AND created_at >= ?", (cutoff,))
+    file_uses = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM events WHERE event='ocr_success' AND created_at >= ?", (cutoff,))
+    ocr_success = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM events WHERE event='ocr_error' AND created_at >= ?", (cutoff,))
+    ocr_errors = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM errors WHERE created_at >= ?", (cutoff,))
+    total_errors = cur.fetchone()[0] or 0
+    cur.execute("SELECT rating, COUNT(*) FROM feedback WHERE created_at >= ? GROUP BY rating ORDER BY rating", (cutoff,))
+    ratings_rows = cur.fetchall()
+    # Daily events
+    cur.execute(
+        """
+        SELECT substr(created_at,1,10) as day, event, COUNT(*) c
+        FROM events
+        WHERE created_at >= ?
+        GROUP BY day, event
+        ORDER BY day, event
+        """ , (cutoff,)
+    )
+    daily_events = cur.fetchall()
+    # Errors detail
+    cur.execute(
+        """
+        SELECT substr(created_at,1,10) as day, error_code, COUNT(*) c
+        FROM errors
+        WHERE created_at >= ?
+        GROUP BY day, error_code
+        ORDER BY c DESC
+        """, (cutoff,)
+    )
+    errors_agg = cur.fetchall()
+    cur.execute("SELECT created_at, user_id, error_code, message FROM errors WHERE created_at >= ? ORDER BY created_at DESC LIMIT 1000", (cutoff,))
+    errors_raw = cur.fetchall()
+    # Feedback raw
+    cur.execute("SELECT created_at, user_id, rating FROM feedback WHERE created_at >= ? ORDER BY created_at DESC", (cutoff,))
+    feedback_raw = cur.fetchall()
+    conn.close()
+
+    wb = openpyxl.Workbook()
+    ws_overview = wb.active
+    ws_overview.title = "Overview"
+    ws_overview.append(["Metric", "Value"])
+    ws_overview.append(["Unique users", unique_users])
+    ws_overview.append(["File uses", file_uses])
+    ws_overview.append(["OCR success", ocr_success])
+    ws_overview.append(["OCR errors", ocr_errors])
+    ws_overview.append(["Errors total", total_errors])
+    ws_overview.append(["Ratings (rating:count)", ", ".join([f"{r[0]}:{r[1]}" for r in ratings_rows]) if ratings_rows else "-"])
+
+    ws_events = wb.create_sheet("DailyEvents")
+    ws_events.append(["Day", "Event", "Count"])
+    for row in daily_events:
+        ws_events.append(list(row))
+
+    ws_errors = wb.create_sheet("ErrorsAgg")
+    ws_errors.append(["Day", "ErrorCode", "Count"])
+    for row in errors_agg:
+        ws_errors.append(list(row))
+
+    ws_errors_raw = wb.create_sheet("ErrorsRaw")
+    ws_errors_raw.append(["CreatedAt", "UserId", "ErrorCode", "Message"])
+    for row in errors_raw:
+        ws_errors_raw.append(list(row))
+
+    ws_feedback = wb.create_sheet("Feedback")
+    ws_feedback.append(["CreatedAt", "UserId", "Rating"])
+    for row in feedback_raw:
+        ws_feedback.append(list(row))
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 def answer_callback_query(callback_query_id, text=None):
     """Отвечает на callback-запрос для снятия индикатора загрузки на кнопке"""
@@ -538,6 +638,17 @@ def telegram_webhook():
             elif text == "/stop":
                 set_user_waiting_for_file(chat_id, False)
                 send_message(chat_id, "🛑 Бот остановлен. Используйте /start для перезапуска.")
+            elif text == "/statistic":
+                if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+                    try:
+                        send_message(chat_id, "⏳ Формирую Excel со статистикой за 30 дней...")
+                        xlsx_buf = generate_excel_stats(last_days=30)
+                        send_binary_document(chat_id, xlsx_buf, "bot_stats_last_30_days.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    except Exception as e:
+                        logger.exception("💥 Ошибка формирования Excel статистики")
+                        send_message(chat_id, "❌ Не удалось сформировать статистику.")
+                else:
+                    send_message(chat_id, "⛔ Недостаточно прав.")
             elif text == "/stats":
                 if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
                     try:
