@@ -640,6 +640,17 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
         lp = last_page if last_page is not None else max_pages_default
         if lp < fp:
             fp, lp = lp, fp
+        
+        # Определяем реальное количество страниц в PDF
+        try:
+            reader = PyPDF2.PdfReader(BytesIO(file_bytes))
+            actual_pages = len(reader.pages)
+            # Ограничиваем обработку реальным количеством страниц
+            lp = min(lp, actual_pages)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось определить количество страниц: {e}")
+            actual_pages = lp - fp + 1
+        
         # Обрабатываем большие файлы по частям для экономии памяти
         total_pages = lp - fp + 1
         if total_pages > 5:  # Если больше 5 страниц, обрабатываем по частям
@@ -652,26 +663,38 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
                 logger.info(f"🔄 Обрабатываем страницы {start_page}-{end_page}...")
                 
                 # Конвертируем только текущую часть
-                chunk_images = convert_from_bytes(file_bytes, dpi=200, first_page=start_page, last_page=end_page)
-                
-                if chunk_images:  # Проверяем, что получили изображения
-                    # Обрабатываем часть
-                    chunk_text = process_image_chunk(chunk_images, progress_callback)
-                    ocr_text += chunk_text + "\n"
-                else:
-                    logger.warning(f"⚠️ Не удалось конвертировать страницы {start_page}-{end_page}")
-                
-                # Освобождаем память
-                del chunk_images
+                try:
+                    chunk_images = convert_from_bytes(file_bytes, dpi=200, first_page=start_page, last_page=end_page)
+                    
+                    if chunk_images:  # Проверяем, что получили изображения
+                        # Обрабатываем часть
+                        chunk_text = process_image_chunk(chunk_images, progress_callback)
+                        ocr_text += chunk_text + "\n"
+                        logger.info(f"✅ Страницы {start_page}-{end_page} обработаны успешно")
+                    else:
+                        logger.warning(f"⚠️ Не удалось конвертировать страницы {start_page}-{end_page}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Ошибка конвертации страниц {start_page}-{end_page}: {e}")
+                finally:
+                    # Освобождаем память
+                    if 'chunk_images' in locals():
+                        del chunk_images
                 
             return clean_text(ocr_text)
         else:
             # Обычная обработка для небольших файлов
-            images = convert_from_bytes(file_bytes, dpi=200, first_page=fp, last_page=lp)
-            if images:
-                return process_image_chunk(images, progress_callback)
-            else:
-                logger.error("❌ Не удалось конвертировать PDF в изображения")
+            try:
+                images = convert_from_bytes(file_bytes, dpi=200, first_page=fp, last_page=lp)
+                if images:
+                    result = process_image_chunk(images, progress_callback)
+                    logger.info(f"✅ Файл ({total_pages} страниц) обработан успешно")
+                    return result
+                else:
+                    logger.error("❌ Не удалось конвертировать PDF в изображения")
+                    return ""
+            except Exception as e:
+                logger.error(f"❌ Ошибка конвертации PDF: {e}")
                 return ""
     except Exception as e:
         logger.exception("💥 OCR провален")
