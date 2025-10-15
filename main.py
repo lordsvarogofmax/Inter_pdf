@@ -164,6 +164,7 @@ def build_rating_keyboard(conversion_id):
             {"text": "⭐", "callback_data": f"RATE_1|{conversion_id}"},
             {"text": "⭐⭐", "callback_data": f"RATE_2|{conversion_id}"},
             {"text": "⭐⭐⭐", "callback_data": f"RATE_3|{conversion_id}"},
+        ], [
             {"text": "⭐⭐⭐⭐", "callback_data": f"RATE_4|{conversion_id}"},
             {"text": "⭐⭐⭐⭐⭐", "callback_data": f"RATE_5|{conversion_id}"},
         ], [
@@ -922,7 +923,7 @@ def telegram_webhook():
                     if is_ocr_needed:
                         send_message(
                             chat_id,
-                            "🔍 Обнаружен скан. Использую OCR. Это займёт 1-3 минуты..."
+                            "🔍 Обнаружен скан. Использую OCR. Это займёт несколько минут..."
                         )
 
                 # Функция для отправки прогресса
