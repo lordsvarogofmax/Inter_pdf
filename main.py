@@ -11,6 +11,9 @@ import PyPDF2
 from pdf2image import convert_from_bytes
 import pytesseract
 from PIL import Image
+import sqlite3
+import json
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
@@ -36,6 +41,103 @@ user_states = {}
 
 # Временное хранилище для больших OCR-PDF, ожидающих выбора пользователя
 pending_files = {}
+
+# --- БД и аналитика ---
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                meta TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                error_code TEXT,
+                message TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.exception("💥 Ошибка инициализации БД")
+
+def log_event(user_id, event, meta=None):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO events (user_id, event, meta, created_at) VALUES (?, ?, ?, ?)",
+            (str(user_id), event, json.dumps(meta) if meta is not None else None, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.exception("💥 Ошибка записи события в БД")
+
+def log_error(user_id, error_code, message):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO errors (user_id, error_code, message, created_at) VALUES (?, ?, ?, ?)",
+            (str(user_id) if user_id else None, error_code, str(message), datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.exception("💥 Ошибка записи ошибки в БД")
+
+def save_feedback(user_id, rating):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO feedback (user_id, rating, created_at) VALUES (?, ?, ?)",
+            (str(user_id), int(rating), datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.exception("💥 Ошибка записи оценки в БД")
+
+def build_rating_keyboard():
+    return {
+        "inline_keyboard": [[
+            {"text": "⭐", "callback_data": "RATE_1"},
+            {"text": "⭐⭐", "callback_data": "RATE_2"},
+            {"text": "⭐⭐⭐", "callback_data": "RATE_3"},
+            {"text": "⭐⭐⭐⭐", "callback_data": "RATE_4"},
+            {"text": "⭐⭐⭐⭐⭐", "callback_data": "RATE_5"},
+        ]]
+    }
 
 # Основное описание бота для показа по кнопке
 DESCRIPTION_MESSAGE = (
@@ -317,6 +419,21 @@ def telegram_webhook():
             if callback_id:
                 answer_callback_query(callback_id)
 
+            # Обработка оценки качества
+            if action and action.startswith("RATE_"):
+                try:
+                    rating = int(action.split("_")[1])
+                    if 1 <= rating <= 5:
+                        save_feedback(chat_id, rating)
+                        log_event(chat_id, "feedback", {"rating": rating})
+                        send_message(chat_id, "🙏 Спасибо! Ваша оценка помогает нам становиться лучше.")
+                    else:
+                        send_message(chat_id, "❌ Некорректная оценка.")
+                except Exception as e:
+                    logger.exception("💥 Ошибка обработки рейтинга")
+                    send_message(chat_id, "❌ Не удалось сохранить оценку.")
+                return "OK", 200
+
             pending = pending_files.get(chat_id)
             if not pending:
                 send_message(chat_id, "❌ Не найден файл для обработки. Отправьте PDF заново.")
@@ -411,6 +528,7 @@ def telegram_webhook():
             if text == "/start":
                 # Сбрасываем состояние пользователя
                 set_user_waiting_for_file(chat_id, False)
+                log_event(chat_id, "start")
                 reply_markup = get_main_keyboard()
                 send_message(
                     chat_id,
@@ -420,9 +538,42 @@ def telegram_webhook():
             elif text == "/stop":
                 set_user_waiting_for_file(chat_id, False)
                 send_message(chat_id, "🛑 Бот остановлен. Используйте /start для перезапуска.")
+            elif text == "/stats":
+                if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor()
+                        cur.execute("SELECT COUNT(DISTINCT user_id) FROM events")
+                        users = cur.fetchone()[0] or 0
+                        cur.execute("SELECT COUNT(*) FROM events WHERE event='file_received'")
+                        uses = cur.fetchone()[0] or 0
+                        cur.execute("SELECT COUNT(*) FROM errors")
+                        err_count = cur.fetchone()[0] or 0
+                        cur.execute("SELECT error_code, COUNT(*) c FROM errors GROUP BY error_code ORDER BY c DESC LIMIT 5")
+                        top_errors = cur.fetchall()
+                        cur.execute("SELECT rating, COUNT(*) c FROM feedback GROUP BY rating ORDER BY rating")
+                        rating_rows = cur.fetchall()
+                        conn.close()
+                        ratings = ", ".join([f"{r[0]}★: {r[1]}" for r in rating_rows]) if rating_rows else "нет"
+                        top_errs = "\n".join([f"- {r[0]}: {r[1]}" for r in top_errors]) if top_errors else "нет"
+                        send_message(
+                            chat_id,
+                            f"📊 Статистика:\n\n"
+                            f"👤 Уникальные пользователи: {users}\n"
+                            f"📥 Загрузок файлов: {uses}\n"
+                            f"⚠️ Ошибок: {err_count}\n\n"
+                            f"Топ ошибок:\n{top_errs}\n\n"
+                            f"Оценки: {ratings}"
+                        )
+                    except Exception as e:
+                        logger.exception("💥 Ошибка /stats")
+                        send_message(chat_id, "❌ Ошибка при получении статистики.")
+                else:
+                    send_message(chat_id, "⛔ Недостаточно прав.")
             elif text == "📤 Отправить PDF на конвертацию":
                 # Пользователь нажал кнопку - устанавливаем состояние ожидания файла
                 set_user_waiting_for_file(chat_id, True)
+                log_event(chat_id, "request_upload")
                 send_message(
                     chat_id,
                     "📎 Отлично! Теперь отправьте PDF файл для конвертации.\n\n💡 Максимальный размер файла: 20 МБ"
@@ -488,6 +639,7 @@ def telegram_webhook():
                 send_message(chat_id, "⚠️ Большой файл. Обработка может занять несколько минут...")
 
             send_message(chat_id, "⏳ Принял PDF. Начинаю обработку...")
+            log_event(chat_id, "file_received", {"size": file_size, "name": doc.get("file_name")})
 
             try:
                 file_id = doc["file_id"]
@@ -497,6 +649,8 @@ def telegram_webhook():
                 if not resp.ok:
                     logger.error(f"❌ Ошибка получения файла: {resp.status_code} - {resp.text}")
                     send_message(chat_id, "❌ Ошибка загрузки файла.")
+                    log_event(chat_id, "ocr_error", {"step": "getFile", "status": resp.status_code})
+                    log_error(chat_id, "GET_FILE", resp.text)
                     return "OK", 200
                 
                 file_path = resp.json()["result"]["file_path"]
@@ -506,6 +660,8 @@ def telegram_webhook():
                 if not file_resp.ok:
                     logger.error(f"❌ Ошибка скачивания файла: {file_resp.status_code}")
                     send_message(chat_id, "❌ Ошибка скачивания файла.")
+                    log_event(chat_id, "ocr_error", {"step": "download", "status": file_resp.status_code})
+                    log_error(chat_id, "DOWNLOAD_FILE", file_resp.text)
                     return "OK", 200
                 
                 file_bytes = file_resp.content
@@ -517,9 +673,15 @@ def telegram_webhook():
                     raw = "\n".join(page.extract_text() or "" for page in reader.pages)
                     is_ocr_needed = not raw.strip()
                     logger.info(f"🔍 PDF тип: {'скан (требует OCR)' if is_ocr_needed else 'текстовый'}")
+                    num_pages_detect = len(reader.pages)
+                    if is_ocr_needed:
+                        log_event(chat_id, "is_ocr", {"pages": num_pages_detect})
+                    else:
+                        log_event(chat_id, "is_text_pdf", {"pages": num_pages_detect})
                 except Exception as e:
                     logger.warning(f"⚠️ Ошибка анализа PDF: {e}")
                     is_ocr_needed = True
+                    log_error(chat_id, "ANALYZE_PDF", repr(e))
 
                 # Определим количество страниц (для OCR-сценариев)
                 num_pages = 0
@@ -561,12 +723,20 @@ def telegram_webhook():
                 )
                 if not text.strip():
                     send_message(chat_id, "❌ Не удалось извлечь текст.")
+                    log_event(chat_id, "ocr_error", {"file_name": doc.get("file_name")})
+                    log_error(chat_id, "OCR_EMPTY", "no text extracted")
                     return "OK", 200
 
                 base_name = doc.get("file_name", "converted")
                 txt_name = os.path.splitext(base_name)[0] + ".txt"
                 txt_buffer = BytesIO(text.encode("utf-8"))
                 send_document(chat_id, txt_buffer, txt_name)
+                log_event(chat_id, "ocr_success", {"file_name": base_name})
+                send_message(
+                    chat_id,
+                    "📝 Оцените качество распознавания (1 — плохо, 5 — отлично):",
+                    reply_markup=build_rating_keyboard()
+                )
 
                 # Сбрасываем состояние ожидания файла
                 set_user_waiting_for_file(chat_id, False)
@@ -582,6 +752,8 @@ def telegram_webhook():
                 logger.exception("💥 Ошибка при обработке PDF")
                 set_user_waiting_for_file(chat_id, False)
                 send_message(chat_id, "❌ Произошла ошибка. Попробуйте снова.")
+                log_event(chat_id, "ocr_error", {"file_name": message.get('document', {}).get('file_name')})
+                log_error(chat_id, "OCR_EXCEPTION", repr(e))
 
     except Exception as e:
         logger.exception("💥 Критическая ошибка в webhook")
@@ -605,6 +777,7 @@ def set_webhook():
 
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
+    init_db()
     set_webhook()
 
     port = int(os.environ.get("PORT", 10000))
