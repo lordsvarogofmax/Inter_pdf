@@ -35,6 +35,9 @@ LOW_RESOURCE = os.getenv("LOW_RESOURCE", "1") == "1"
 OCR_DPI = int(os.getenv("OCR_DPI", "150"))  # ниже DPI — меньше память и CPU
 OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "1"))  # 1 поток по умолчанию
 OCR_TEXT_THRESHOLD_CHARS = int(os.getenv("OCR_TEXT_THRESHOLD_CHARS", "30"))  # порог длины текста, чтобы считать страницу текстовой
+OCR_ENABLE_RETRY = os.getenv("OCR_ENABLE_RETRY", "1") == "1"  # включить повторную попытку для сложных страниц
+OCR_RETRY_SCALE = float(os.getenv("OCR_RETRY_SCALE", "1.8"))  # масштаб апскейла при повторе
+OCR_RETRY_EXTRA_PSMS = os.getenv("OCR_RETRY_EXTRA_PSMS", "1,11,12,13")  # дополнительные PSM для сложных макетов
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
@@ -785,6 +788,54 @@ def process_image_chunk(images, progress_callback=None):
             if not text.strip() and best_text.strip():
                 text = best_text
                 logger.info(f"✅ Используем лучший результат из всех попыток ({max_length} символов)")
+
+            # Качественный ретрай: если текст слишком короткий/плохой — апскейл и расширенные PSM
+            if OCR_ENABLE_RETRY and len((text or "").strip()) < (60 if LOW_RESOURCE else 90):
+                try:
+                    retry_variants = []
+                    # Берем лучший из существующих как основу, либо оригинал
+                    base_img = img_variants[0][1] if img_variants else img
+                    # Апскейл
+                    width, height = base_img.size
+                    new_size = (int(width * OCR_RETRY_SCALE), int(height * OCR_RETRY_SCALE))
+                    upscaled = base_img.resize(new_size, Image.Resampling.LANCZOS)
+                    retry_variants.append(("upscaled", upscaled))
+
+                    # Дополнительные PSMы для сложных макетов
+                    extra_psms = [p.strip() for p in OCR_RETRY_EXTRA_PSMS.split(',') if p.strip()]
+                    # Базовые конфиги с whitelists
+                    retry_configs = []
+                    for psm in extra_psms:
+                        retry_configs.append(
+                            f"--psm {psm} --oem 3 -c preserve_interword_spaces=1"
+                        )
+                        retry_configs.append(
+                            f"--psm {psm} --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1"
+                        )
+
+                    best_retry = text
+                    best_retry_len = len((text or "").strip())
+                    for rname, rimg in retry_variants:
+                        for rconfig in retry_configs:
+                            try:
+                                r = pytesseract.image_to_string(rimg, lang='rus+eng', config=rconfig)
+                                rlen = len((r or "").strip())
+                                if rlen > best_retry_len:
+                                    best_retry = r
+                                    best_retry_len = rlen
+                                    logger.info(f"🔁 Улучшение после ретрая {rname} psm={rconfig.split()[1]} → {rlen} симв.")
+                                # Достаточно хороший текст — выходим
+                                if rlen >= (120 if LOW_RESOURCE else 160):
+                                    break
+                            except Exception as e:
+                                logger.debug(f"⚠️ Ошибка ретрая OCR: {e}")
+                        if best_retry_len >= (120 if LOW_RESOURCE else 160):
+                            break
+                    if best_retry_len > len((text or "").strip()):
+                        text = best_retry
+                        logger.info("✅ Ретрай дал лучший результат, используем его")
+                except Exception as e:
+                    logger.debug(f"⚠️ Ретрай не выполнен: {e}")
             
         except Exception as e:
             logger.error(f"❌ Ошибка OCR на странице {i+1}: {e}")
