@@ -38,6 +38,8 @@ OCR_TEXT_THRESHOLD_CHARS = int(os.getenv("OCR_TEXT_THRESHOLD_CHARS", "30"))  # �
 OCR_ENABLE_RETRY = os.getenv("OCR_ENABLE_RETRY", "1") == "1"  # включить повторную попытку для сложных страниц
 OCR_RETRY_SCALE = float(os.getenv("OCR_RETRY_SCALE", "1.8"))  # масштаб апскейла при повторе
 OCR_RETRY_EXTRA_PSMS = os.getenv("OCR_RETRY_EXTRA_PSMS", "1,11,12,13")  # дополнительные PSM для сложных макетов
+OCR_FUTURE_TIMEOUT_SEC = int(os.getenv("OCR_FUTURE_TIMEOUT_SEC", "60"))  # таймаут на распознавание одной страницы
+OCR_TOTAL_TIMEOUT_SEC = int(os.getenv("OCR_TOTAL_TIMEOUT_SEC", "180"))  # общий лимит времени на документ
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
@@ -656,11 +658,16 @@ def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=Non
         logger.info(f"📄 Обработка страниц {fp}-{lp} (всего {total_pages})")
 
         collected_text = []
+        start_time = time.time()
 
         # Последовательная обработка страниц для экономии памяти
         for page_index in range(fp - 1, lp):
             page_num_human = page_index + 1
             try:
+                # Проверка общего таймаута на документ
+                if OCR_TOTAL_TIMEOUT_SEC and (time.time() - start_time) > OCR_TOTAL_TIMEOUT_SEC:
+                    logger.warning("⏰ Истек общий таймаут обработки документа, возвращаем частичный результат")
+                    break
                 page_text = ""
                 if reader is not None:
                     try:
@@ -849,9 +856,9 @@ def process_image_chunk(images, progress_callback=None):
         
         # Добавляем таймаут для предотвращения зависания
         from concurrent.futures import TimeoutError
-        for fut in as_completed(futures, timeout=300):  # 5 минут на страницу
+        for fut in as_completed(futures, timeout=OCR_FUTURE_TIMEOUT_SEC * max(1, len(images))):
             try:
-                i, text = fut.result()
+                i, text = fut.result(timeout=OCR_FUTURE_TIMEOUT_SEC)
                 if progress_callback:
                     progress_callback(f"✅ Страница {i+1} завершена")
                 else:
