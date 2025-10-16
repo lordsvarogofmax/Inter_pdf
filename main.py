@@ -40,6 +40,8 @@ OCR_RETRY_SCALE = float(os.getenv("OCR_RETRY_SCALE", "1.8"))  # масштаб �
 OCR_RETRY_EXTRA_PSMS = os.getenv("OCR_RETRY_EXTRA_PSMS", "1,11,12,13")  # дополнительные PSM для сложных макетов
 OCR_FUTURE_TIMEOUT_SEC = int(os.getenv("OCR_FUTURE_TIMEOUT_SEC", "60"))  # таймаут на распознавание одной страницы
 OCR_TOTAL_TIMEOUT_SEC = int(os.getenv("OCR_TOTAL_TIMEOUT_SEC", "180"))  # общий лимит времени на документ
+OCR_RETRY_MAX_PSMS = int(os.getenv("OCR_RETRY_MAX_PSMS", "2"))  # ограничить число PSM при ретрае
+OCR_MAX_UPSCALED_DIM = int(os.getenv("OCR_MAX_UPSCALED_DIM", "2000"))  # максимум пикселей по стороне после апскейла
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
@@ -802,14 +804,20 @@ def process_image_chunk(images, progress_callback=None):
                     retry_variants = []
                     # Берем лучший из существующих как основу, либо оригинал
                     base_img = img_variants[0][1] if img_variants else img
-                    # Апскейл
+                    # Апскейл с ограничением максимального размера
                     width, height = base_img.size
-                    new_size = (int(width * OCR_RETRY_SCALE), int(height * OCR_RETRY_SCALE))
+                    scaled_w = int(width * OCR_RETRY_SCALE)
+                    scaled_h = int(height * OCR_RETRY_SCALE)
+                    if max(scaled_w, scaled_h) > OCR_MAX_UPSCALED_DIM:
+                        scale_clip = OCR_MAX_UPSCALED_DIM / max(scaled_w, scaled_h)
+                        scaled_w = max(1, int(scaled_w * scale_clip))
+                        scaled_h = max(1, int(scaled_h * scale_clip))
+                    new_size = (scaled_w, scaled_h)
                     upscaled = base_img.resize(new_size, Image.Resampling.LANCZOS)
                     retry_variants.append(("upscaled", upscaled))
 
                     # Дополнительные PSMы для сложных макетов
-                    extra_psms = [p.strip() for p in OCR_RETRY_EXTRA_PSMS.split(',') if p.strip()]
+                    extra_psms = [p.strip() for p in OCR_RETRY_EXTRA_PSMS.split(',') if p.strip()][:OCR_RETRY_MAX_PSMS]
                     # Базовые конфиги с whitelists
                     retry_configs = []
                     for psm in extra_psms:
@@ -851,6 +859,16 @@ def process_image_chunk(images, progress_callback=None):
 
     # Уменьшаем количество потоков (env-переключатель)
     max_workers = max(1, min(OCR_MAX_WORKERS, len(images)))
+    # Если одна страница — без пула потоков, чтобы избежать накладных расходов
+    if len(images) == 1:
+        i, text = ocr_single((0, images[0]))
+        if progress_callback:
+            progress_callback(f"✅ Страница {i+1} завершена")
+        else:
+            logger.info(f"✅ Страница {i+1} завершена")
+        ocr_text += text + "\n"
+        return clean_text(ocr_text)
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(ocr_single, (i, img)): i for i, img in enumerate(images)}
         
