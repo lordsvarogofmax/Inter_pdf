@@ -11,9 +11,9 @@ RUN apt-get update && \
         libgomp1 \
         && rm -rf /var/lib/apt/lists/*
 
-# Увеличиваем лимиты памяти для tesseract
-ENV OMP_THREAD_LIMIT=2
-ENV OMP_NUM_THREADS=2
+# Ограничиваем потоки для экономии CPU на free tier
+ENV OMP_THREAD_LIMIT=1
+ENV OMP_NUM_THREADS=1
 
 WORKDIR /app
 COPY requirements.txt .

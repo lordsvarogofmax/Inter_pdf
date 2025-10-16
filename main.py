@@ -30,6 +30,12 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "364191893")
 
+# Режимы экономии ресурсов (для Render free tier)
+LOW_RESOURCE = os.getenv("LOW_RESOURCE", "1") == "1"
+OCR_DPI = int(os.getenv("OCR_DPI", "150"))  # ниже DPI — меньше память и CPU
+OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "1"))  # 1 поток по умолчанию
+OCR_TEXT_THRESHOLD_CHARS = int(os.getenv("OCR_TEXT_THRESHOLD_CHARS", "30"))  # порог длины текста, чтобы считать страницу текстовой
+
 if not BOT_TOKEN or not WEBHOOK_URL:
     logger.critical("❌ BOT_TOKEN or WEBHOOK_URL not set!")
     sys.exit(1)
@@ -566,13 +572,13 @@ def preprocess_image_for_ocr(img_pil):
 def enhance_ocr_with_alternatives(img_pil):
     """Дополнительные методы улучшения OCR для сложных случаев"""
     try:
-        # Создаем несколько вариантов изображения для OCR
+        # В low-resource режиме ограничиваем варианты для экономии CPU/RAM
+        if LOW_RESOURCE:
+            return [("original", preprocess_image_for_ocr(img_pil))]
+
         variants = []
-        
-        # Вариант 1: Оригинальная предобработка
         variants.append(("original", preprocess_image_for_ocr(img_pil)))
-        
-        # Вариант 2: Инвертированные цвета (для белого текста на темном фоне)
+
         img_cv = pil_to_cv(img_pil)
         if img_cv.ndim == 3:
             gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
@@ -580,15 +586,10 @@ def enhance_ocr_with_alternatives(img_pil):
             gray = img_cv
         inverted = 255 - gray
         variants.append(("inverted", cv_to_pil(inverted)))
-        
-        # Вариант 3: Высокий контраст
         high_contrast = cv2.convertScaleAbs(gray, alpha=2.0, beta=0)
         variants.append(("high_contrast", cv_to_pil(high_contrast)))
-        
-        # Вариант 4: Размытие для сглаживания
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
         variants.append(("blurred", cv_to_pil(blurred)))
-        
         return variants
     except Exception as e:
         logger.warning(f"⚠️ Ошибка создания вариантов изображения: {e}")
@@ -626,78 +627,79 @@ def handle_file_questions(text):
     return None
 
 def extract_text_from_pdf(file_bytes, is_ocr_needed=False, progress_callback=None, first_page=None, last_page=None, max_pages_default=10):
-    """Извлекает текст из PDF только через OCR для лучшего качества.
+    """Гибридное извлечение текста: нативный текст из PDF, OCR только для изображений.
 
-    Все PDF файлы обрабатываются через OCR для обеспечения стабильного качества.
-    Можно указать диапазон страниц через first_page/last_page.
-    По умолчанию обрабатываются первые max_pages_default страниц.
+    - В low-resource режиме используем по-страничную обработку и сниженный DPI.
+    - Если страница содержит нативный текст, берем его без OCR.
+    - Если страница пустая или без текста — включаем OCR только для этой страницы.
+    - Можно ограничить диапазон страниц (first_page/last_page) и общий лимит страниц.
     """
-    # Всегда используем OCR для лучшего качества распознавания
-    logger.info("🖼️ Запуск OCR...")
     try:
-        # Определяем диапазон страниц и уменьшаем DPI для экономии памяти
         fp = first_page if first_page is not None else 1
         lp = last_page if last_page is not None else max_pages_default
         if lp < fp:
             fp, lp = lp, fp
-        
-        # Определяем реальное количество страниц в PDF
+
         try:
             reader = PyPDF2.PdfReader(BytesIO(file_bytes))
             actual_pages = len(reader.pages)
-            # Ограничиваем обработку реальным количеством страниц
             lp = min(lp, actual_pages)
         except Exception as e:
             logger.warning(f"⚠️ Не удалось определить количество страниц: {e}")
+            reader = None
             actual_pages = lp - fp + 1
-        
-        # Обрабатываем большие файлы по частям для экономии памяти
+
         total_pages = lp - fp + 1
-        if total_pages > 5:  # Если больше 5 страниц, обрабатываем по частям
-            logger.info(f"📄 Большой файл ({total_pages} страниц), обрабатываем по частям...")
-            ocr_text = ""
-            chunk_size = 3  # По 3 страницы за раз
-            
-            for start_page in range(fp, lp + 1, chunk_size):
-                end_page = min(start_page + chunk_size - 1, lp)
-                logger.info(f"🔄 Обрабатываем страницы {start_page}-{end_page}...")
-                
-                # Конвертируем только текущую часть
-                try:
-                    chunk_images = convert_from_bytes(file_bytes, dpi=200, first_page=start_page, last_page=end_page)
-                    
-                    if chunk_images:  # Проверяем, что получили изображения
-                        # Обрабатываем часть
-                        chunk_text = process_image_chunk(chunk_images, progress_callback)
-                        ocr_text += chunk_text + "\n"
-                        logger.info(f"✅ Страницы {start_page}-{end_page} обработаны успешно")
-                    else:
-                        logger.warning(f"⚠️ Не удалось конвертировать страницы {start_page}-{end_page}")
-                        
-                except Exception as e:
-                    logger.error(f"❌ Ошибка конвертации страниц {start_page}-{end_page}: {e}")
-                finally:
-                    # Освобождаем память
-                    if 'chunk_images' in locals():
-                        del chunk_images
-                
-            return clean_text(ocr_text)
-        else:
-            # Обычная обработка для небольших файлов
+        logger.info(f"📄 Обработка страниц {fp}-{lp} (всего {total_pages})")
+
+        collected_text = []
+
+        # Последовательная обработка страниц для экономии памяти
+        for page_index in range(fp - 1, lp):
+            page_num_human = page_index + 1
             try:
-                images = convert_from_bytes(file_bytes, dpi=200, first_page=fp, last_page=lp)
-                if images:
-                    result = process_image_chunk(images, progress_callback)
-                    logger.info(f"✅ Файл ({total_pages} страниц) обработан успешно")
-                    return result
-                else:
-                    logger.error("❌ Не удалось конвертировать PDF в изображения")
-                    return ""
+                page_text = ""
+                if reader is not None:
+                    try:
+                        page = reader.pages[page_index]
+                        # В PyPDF2 3.x: extract_text() может вернуть None
+                        native_text = page.extract_text() or ""
+                        # Отбрасываем шум: слишком короткие строки — вероятно артефакты
+                        native_text_clean = native_text.strip()
+                        if len(native_text_clean) >= OCR_TEXT_THRESHOLD_CHARS:
+                            page_text = native_text_clean
+                            logger.info(f"📝 p.{page_num_human}: использован нативный текст ({len(page_text)} симв.)")
+                    except Exception as e:
+                        logger.debug(f"⚠️ p.{page_num_human}: ошибка нативного извлечения: {e}")
+
+                if not page_text:
+                    # OCR только этой страницы
+                    dpi = OCR_DPI if LOW_RESOURCE else 200
+                    try:
+                        images = convert_from_bytes(
+                            file_bytes,
+                            dpi=dpi,
+                            first_page=page_num_human,
+                            last_page=page_num_human
+                        )
+                        if images:
+                            page_text = process_image_chunk(images, progress_callback)
+                            logger.info(f"🔎 p.{page_num_human}: OCR ({dpi} DPI) -> {len(page_text)} симв.")
+                        else:
+                            logger.warning(f"⚠️ p.{page_num_human}: не удалось конвертировать в изображение")
+                    except Exception as e:
+                        logger.error(f"❌ p.{page_num_human}: ошибка конвертации/OCR: {e}")
+
+                collected_text.append(page_text)
+                if progress_callback:
+                    progress_callback(f"✅ Страница {page_num_human} завершена")
             except Exception as e:
-                logger.error(f"❌ Ошибка конвертации PDF: {e}")
-                return ""
-    except Exception as e:
-        logger.exception("💥 OCR провален")
+                logger.error(f"❌ p.{page_num_human}: общая ошибка обработки страницы: {e}")
+                collected_text.append("")
+
+        return clean_text("\n".join(collected_text))
+    except Exception:
+        logger.exception("💥 Ошибка гибридного извлечения")
         raise
 
 def process_image_chunk(images, progress_callback=None):
@@ -707,7 +709,6 @@ def process_image_chunk(images, progress_callback=None):
         return ""
     
     ocr_text = ""
-    # Параллельное распознавание страниц для ускорения
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def ocr_single(idx_img):
@@ -727,20 +728,21 @@ def process_image_chunk(images, progress_callback=None):
                 ".,:;!?()\-–—_№%$€₽«»""''"
             )
             
-            # Множественные конфигурации для разных типов документов
-            configs = [
-                # Для обычного текста
-                f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
-                # Для блочного текста
-                f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
-                # Для одной колонки
-                f"--psm 3 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
-                # Для таблиц и форм
-                f"--psm 8 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
-                # Без whitelist для сложных случаев
-                "--psm 6 --oem 3 -c preserve_interword_spaces=1",
-                "--psm 4 --oem 3 -c preserve_interword_spaces=1"
-            ]
+            # Множественные конфигурации (урезаем в low-resource)
+            if LOW_RESOURCE:
+                configs = [
+                    f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                    f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                ]
+            else:
+                configs = [
+                    f"--psm 6 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                    f"--psm 4 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                    f"--psm 3 --oem 3 -c tessedit_char_whitelist={safe_whitelist} -c preserve_interword_spaces=1",
+                    f"--psm 8 --oem 3 -c tessedit_char_whitelist={safe_whitelist}",
+                    "--psm 6 --oem 3 -c preserve_interword_spaces=1",
+                    "--psm 4 --oem 3 -c preserve_interword_spaces=1"
+                ]
             
             # Получаем варианты изображения для OCR
             img_variants = enhance_ocr_with_alternatives(img)
@@ -749,7 +751,7 @@ def process_image_chunk(images, progress_callback=None):
             best_text = ""
             max_length = 0
             
-            # Пробуем все комбинации вариантов изображения и конфигураций
+            # Пробуем комбинации вариантов изображения и конфигураций
             for variant_name, variant_img in img_variants:
                 for config in configs:
                     try:
@@ -766,7 +768,8 @@ def process_image_chunk(images, progress_callback=None):
                                 best_text = result
                             
                             # Если результат достаточно хорош, используем его
-                            if len(result.strip()) > 100:  # Минимум 100 символов
+                            min_ok = 80 if LOW_RESOURCE else 100
+                            if len(result.strip()) > min_ok:
                                 text = result
                                 logger.info(f"✅ Найден хороший результат с {variant_name} и конфигом {config[:20]}...")
                                 break
@@ -788,8 +791,8 @@ def process_image_chunk(images, progress_callback=None):
             text = ""
         return i, text
 
-    # Уменьшаем количество потоков для Render (ограниченная память)
-    max_workers = max(1, min(3, len(images)))  # Минимум 1 поток
+    # Уменьшаем количество потоков (env-переключатель)
+    max_workers = max(1, min(OCR_MAX_WORKERS, len(images)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(ocr_single, (i, img)): i for i, img in enumerate(images)}
         
